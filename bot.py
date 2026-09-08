@@ -2,12 +2,11 @@
 Telegram Group Helper Bot — Channel APK Search
 =============================================
 Monitors a Telegram channel for posts containing #AppName tags.
-When a user in a group mentions an app name (single word, hashtag,
-or full sentence), the bot searches the channel database and replies
-with a direct link to the MATCHING channel post.
+When a user in a group mentions an app name, the bot searches the
+channel database and replies with a direct link to the LATEST post.
 
-Key feature: If the same app has been posted multiple times (e.g. updates),
-the bot only returns the LATEST post link — old/expired links are skipped.
+Auto-import: On first startup (or after database reset), the bot
+automatically imports existing channel history using Pyrogram.
 """
 
 import os
@@ -41,8 +40,13 @@ if not BOT_TOKEN:
     )
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 PORT = int(os.getenv("PORT", "10000"))
+
+# Telegram API credentials (for auto-import)
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
 
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
@@ -51,7 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Keep-alive web server (for Render / Railway free tier)
+# Keep-alive web server (for Render / Railway)
 # ---------------------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -61,11 +65,10 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is running!")
 
     def log_message(self, format, *args):
-        pass  # Suppress default HTTP logs
+        pass
 
 
 def start_keep_alive(port: int) -> None:
-    """Start a minimal HTTP server so Render doesn't kill the service."""
     try:
         server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
         logger.info("Keep-alive server listening on port %d", port)
@@ -121,23 +124,27 @@ def init_db() -> None:
     conn.close()
 
 
-def store_post(message_id, chat_id, app_name, full_text, link):
+def store_post(message_id, chat_id, app_name, full_text, link, created_at=None):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT OR REPLACE INTO channel_posts "
-        "(message_id, chat_id, app_name, full_text, link) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (message_id, chat_id, app_name, full_text, link),
-    )
+    if created_at:
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_posts "
+            "(message_id, chat_id, app_name, full_text, link, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (message_id, chat_id, app_name, full_text, link, created_at),
+        )
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_posts "
+            "(message_id, chat_id, app_name, full_text, link) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (message_id, chat_id, app_name, full_text, link),
+        )
     conn.commit()
     conn.close()
 
 
 def search_by_app_name(query: str, limit: int = 5) -> list:
-    """
-    Search channel posts by app name.
-    Returns only the LATEST post per app name (deduplicated).
-    """
     conn = sqlite3.connect(DB_PATH)
     query_clean = query.strip().lower().replace(" ", "")
 
@@ -153,7 +160,7 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
         for r in cursor.fetchall()
     ]
 
-    # 2) If no exact match, try partial / LIKE match (newest first)
+    # 2) Partial / LIKE match (newest first)
     if not results:
         like_query = f"%{query.strip().lower()}%"
         cursor = conn.execute(
@@ -169,7 +176,7 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
 
     conn.close()
 
-    # 3) Deduplicate: keep only the LATEST post per unique app_name
+    # 3) Deduplicate: keep only LATEST post per app_name
     seen_apps = set()
     deduped = []
     for post in results:
@@ -260,6 +267,92 @@ def is_search_request(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Auto-import channel history
+# ---------------------------------------------------------------------------
+def get_channel_target():
+    """Determine the channel to import from."""
+    if CHANNEL_USERNAME:
+        return CHANNEL_USERNAME
+    if CHANNEL_ID:
+        return int(CHANNEL_ID)
+    return None
+
+
+def auto_import_history():
+    """
+    Automatically import all existing channel posts into the database.
+    Uses Pyrogram (MTProto API) to read channel history.
+    Runs on startup if the database is empty.
+    """
+    if not API_ID or not API_HASH:
+        logger.warning(
+            "API_ID/API_HASH not set — skipping auto-import. "
+            "Bot will only track NEW channel posts."
+        )
+        return
+
+    channel_target = get_channel_target()
+    if not channel_target:
+        logger.warning(
+            "CHANNEL_USERNAME or CHANNEL_ID not set — skipping auto-import."
+        )
+        return
+
+    try:
+        from pyrogram import Client
+    except ImportError:
+        logger.error("Pyrogram not installed! Run: pip install pyrogram tgcrypto")
+        return
+
+    logger.info("Starting auto-import of channel history...")
+    imported = 0
+    skipped = 0
+
+    try:
+        client = Client(
+            "bot_auto_import",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN,
+            in_memory=True,
+        )
+
+        with client:
+            for message in client.get_chat_history(channel_target):
+                text = message.text or message.caption or ""
+                if not text:
+                    skipped += 1
+                    continue
+
+                chat_id = message.chat.id
+                message_id = message.id
+                link = build_message_link(chat_id, message_id)
+
+                hashtags = extract_hashtags(text)
+                if hashtags:
+                    app_name = hashtags[0]
+                else:
+                    skipped += 1
+                    continue
+
+                # Use message date for accurate created_at
+                created_at = message.date.isoformat() if message.date else None
+
+                store_post(message_id, chat_id, app_name, text, link, created_at)
+                imported += 1
+
+                if imported % 100 == 0:
+                    logger.info("Auto-import: %d posts imported so far...", imported)
+
+        logger.info(
+            "✅ Auto-import complete! Imported: %d posts, Skipped: %d",
+            imported, skipped,
+        )
+    except Exception as e:
+        logger.error("Auto-import failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -287,6 +380,28 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     count = get_post_count()
     await update.message.reply_text(
         f"📊 *Bot Statistics*\n\n📚 Total channel posts: *{count}*",
+        parse_mode="Markdown",
+    )
+
+
+async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually trigger channel history import."""
+    # Only allow admins to run this
+    user = update.effective_user
+    if not user:
+        return
+
+    await update.message.reply_text(
+        "⏳ Importing channel history... This may take a few minutes."
+    )
+
+    # Run import in background
+    threading.Thread(target=auto_import_history, daemon=True).start()
+
+    count = get_post_count()
+    await update.message.reply_text(
+        f"✅ Import started! Current database has *{count}* posts.\n"
+        f"Run /stats after a minute to check updated count.",
         parse_mode="Markdown",
     )
 
@@ -373,6 +488,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Exception: %s", context.error)
 
 
+async def post_init(application: Application) -> None:
+    """Run after the bot is initialized but before polling starts."""
+    count = get_post_count()
+    if count == 0:
+        logger.info("Database is empty — running auto-import...")
+        auto_import_history()
+    else:
+        logger.info("Database has %d posts — skipping auto-import.", count)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -385,12 +510,13 @@ def main() -> None:
     )
     keep_alive_thread.start()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("import", import_command))
 
     # Channel post handler
     app.add_handler(
