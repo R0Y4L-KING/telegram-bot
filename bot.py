@@ -5,9 +5,8 @@ Monitors a Telegram channel for posts containing #AppName tags.
 When a user in a group mentions an app name, the bot searches the
 channel database and replies with a direct link to the LATEST post.
 
-Auto-import: On first startup (or after database reset), the bot
-automatically imports existing channel history using a user session
-string (bots can't read channel history directly).
+Auto-import: On first startup, the bot imports existing channel history
+using a user session string (Telethon), because bots cannot read history.
 """
 
 import os
@@ -48,7 +47,8 @@ PORT = int(os.getenv("PORT", "10000"))
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "")
+# Strip whitespace/newlines that might get added during copy-paste
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
@@ -99,6 +99,7 @@ NOISE_WORDS = frozenset({
     "ok", "okay", "thanks", "thank", "thx", "sorry", "bye",
     "bot", "admin", "group", "channel", "k", "kk", "hmm", "hmmm",
     "wow", "nice", "cool", "good", "bad", "fine", "great",
+    "sir", "madam", "master", "boss",
 })
 
 
@@ -266,7 +267,7 @@ def is_search_request(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Auto-import channel history (using USER session, not bot token)
+# Auto-import channel history (using Telethon + user session string)
 # ---------------------------------------------------------------------------
 def get_channel_target():
     if CHANNEL_USERNAME:
@@ -278,12 +279,8 @@ def get_channel_target():
 
 async def auto_import_history_async():
     """
-    Import all existing channel posts using a user session string.
-    Bots cannot read channel history (Telegram API restriction),
-    so we use a user session string for the import.
-
-    The bot token is still used for normal operations (polling,
-    responding to group messages, receiving new channel posts).
+    Import all existing channel posts using a Telethon user session string.
+    Telegram bots cannot read channel history, so we use a user session.
     """
     if not SESSION_STRING:
         logger.warning(
@@ -305,35 +302,43 @@ async def auto_import_history_async():
         return 0
 
     try:
-        from pyrogram import Client
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        from telethon.tl.types import Channel
     except ImportError:
-        logger.error("Pyrogram not installed! Run: pip install pyrogram tgcrypto")
+        logger.error("Telethon not installed! Run: pip install telethon")
         return 0
 
-    logger.info("Starting auto-import using user session string...")
+    logger.info("Starting auto-import using Telethon user session...")
     imported = 0
     skipped = 0
 
+    client = None
     try:
-        # Use USER session (not bot token) — bots can't read history
-        client = Client(
-            "bot_user_session",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            session_string=SESSION_STRING,
-            in_memory=True,
+        client = TelegramClient(
+            StringSession(SESSION_STRING),
+            API_ID,
+            API_HASH,
         )
 
         await client.start()
-        logger.info("Pyrogram user session started, reading channel history...")
+        logger.info("Telethon user session started, reading channel history...")
 
-        async for message in client.get_chat_history(channel_target):
-            text = message.text or message.caption or ""
+        # Resolve the channel entity
+        entity = await client.get_entity(channel_target)
+        logger.info("Resolved channel entity: %s", getattr(entity, 'title', str(channel_target)))
+
+        # Iterate through all messages (newest first)
+        async for message in client.iter_messages(entity):
+            text = message.text or message.message or ""
             if not text:
                 skipped += 1
                 continue
 
-            chat_id = message.chat.id
+            chat_id = message.chat_id or message.peer_id.channel_id
+            if hasattr(message.peer_id, 'channel_id'):
+                # Convert to Telegram's internal format for link building
+                chat_id = -1000000000000 - message.peer_id.channel_id
             message_id = message.id
             link = build_message_link(chat_id, message_id)
 
@@ -351,17 +356,18 @@ async def auto_import_history_async():
             if imported % 100 == 0:
                 logger.info("Auto-import: %d posts imported so far...", imported)
 
-        await client.stop()
         logger.info(
             "✅ Auto-import complete! Imported: %d posts, Skipped: %d",
             imported, skipped,
         )
     except Exception as e:
         logger.error("Auto-import failed: %s", e)
-        try:
-            await client.stop()
-        except Exception:
-            pass
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     return imported
 
@@ -451,7 +457,12 @@ async def channel_post_handler(
 
 
 async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message_text = update.message.text or ""
+    # Safety check: make sure message and text exist
+    if not update.message or not update.message.text:
+        return
+
+    message_text = update.message.text
+
     if not is_search_request(message_text):
         return
     app_query = extract_app_name_from_sentence(message_text)
