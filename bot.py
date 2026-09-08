@@ -4,7 +4,10 @@ Telegram Group Helper Bot — Channel APK Search
 Monitors a Telegram channel for posts containing #AppName tags.
 When a user in a group mentions an app name (single word, hashtag,
 or full sentence), the bot searches the channel database and replies
-with a direct link to the matching channel post.
+with a direct link to the MATCHING channel post.
+
+Key feature: If the same app has been posted multiple times (e.g. updates),
+the bot only returns the LATEST post link — old/expired links are skipped.
 """
 
 import os
@@ -47,29 +50,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Hashtag & text patterns
 # ---------------------------------------------------------------------------
-# Matches #AppName (letters, numbers, spaces allowed between words)
-# Examples: #QuickTv, #Remini, #IstreamFlare, #I Stream Flare
 HASHTAG_PATTERN = re.compile(r"#([a-zA-Z0-9][a-zA-Z0-9 _]{1,40})", re.IGNORECASE)
 
-# Words that are NOT app names — used to clean up sentences
 NOISE_WORDS = frozenset({
-    # Common Hindi/English filler words
     "bhai", "bro", "dude", "mate", "yo", "pls", "please", "kya", "hai",
     "hain", "nahi", "haan", "ka", "ki", "ke", "ko", "me", "mein", "se",
     "par", "aur", "ya", "to", "bhi", "hi", "tha", "thi", "the", "ho",
-    "de", "do", "dila", "dilado", "dilado", "chahiye", "chahiya",
+    "de", "do", "dila", "dilado", "chahiye", "chahiya",
     "mujhe", "muje", "mujhko", "hamko", "humko", "merako",
-    # APK / app related request words
     "apk", "app", "mod", "update", "krdo", "kar", "karo", "dena", "de do",
     "bhejo", "send", "link", "download", "latest", "new", "old", "version",
-    # Common English stopwords
     "the", "a", "an", "is", "am", "are", "was", "were", "be", "been",
     "and", "or", "but", "if", "so", "for", "of", "to", "in", "on", "at",
     "by", "with", "from", "this", "that", "it", "as",
-    # Greetings
     "hi", "hello", "hey", "hlo", "hii", "helo", "namaste", "namaskar",
     "ok", "okay", "thanks", "thank", "thx", "sorry", "bye",
-    # Misc
     "bot", "admin", "group", "channel", "k", "kk", "hmm", "hmmm",
     "wow", "nice", "cool", "good", "bad", "fine", "great",
 })
@@ -124,31 +119,40 @@ def store_post(
 def search_by_app_name(query: str, limit: int = 5) -> list:
     """
     Search channel posts by app name.
-    Tries exact match first, then partial match.
+    Returns only the LATEST post per app name (deduplicated).
+
+    If the same app has been posted multiple times (e.g. updates in 2023,
+    2024, 2025), only the most recent post is returned — old/expired links
+    are skipped.
+
+    Strategy:
+    1. Exact match on app_name (case-insensitive, spaces removed) — newest first
+    2. If no exact match, try partial LIKE match — newest first
+    3. Deduplicate results by app_name (keep only the latest per app)
     """
     conn = sqlite3.connect(DB_PATH)
     query_clean = query.strip().lower().replace(" ", "")
 
-    # 1) Exact match on app_name (case-insensitive, spaces removed)
+    # 1) Exact match (newest first)
     cursor = conn.execute(
         "SELECT app_name, full_text, link, message_id FROM channel_posts "
         "WHERE LOWER(REPLACE(app_name, ' ', '')) = ? "
-        "ORDER BY created_at DESC LIMIT ?",
-        (query_clean, limit),
+        "ORDER BY created_at DESC",
+        (query_clean,),
     )
     results = [
         {"app_name": r[0], "text": r[1], "link": r[2], "message_id": r[3]}
         for r in cursor.fetchall()
     ]
 
-    # 2) If no exact match, try partial / LIKE match
+    # 2) If no exact match, try partial / LIKE match (newest first)
     if not results:
         like_query = f"%{query.strip().lower()}%"
         cursor = conn.execute(
             "SELECT app_name, full_text, link, message_id FROM channel_posts "
             "WHERE LOWER(app_name) LIKE ? OR LOWER(full_text) LIKE ? "
-            "ORDER BY created_at DESC LIMIT ?",
-            (like_query, like_query, limit),
+            "ORDER BY created_at DESC",
+            (like_query, like_query),
         )
         results = [
             {"app_name": r[0], "text": r[1], "link": r[2], "message_id": r[3]}
@@ -156,7 +160,19 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
         ]
 
     conn.close()
-    return results
+
+    # 3) Deduplicate: keep only the LATEST post per unique app_name
+    seen_apps = set()
+    deduped = []
+    for post in results:
+        app_key = (post["app_name"] or "").strip().lower().replace(" ", "")
+        if app_key not in seen_apps:
+            seen_apps.add(app_key)
+            deduped.append(post)
+        if len(deduped) >= limit:
+            break
+
+    return deduped
 
 
 def get_post_count() -> int:
@@ -180,7 +196,6 @@ def build_message_link(chat_id: int, message_id: int) -> str:
 # Text extraction & parsing
 # ---------------------------------------------------------------------------
 def extract_hashtags(text: str) -> list:
-    """Extract all #AppName tags from text. Returns list of cleaned names."""
     matches = HASHTAG_PATTERN.findall(text)
     cleaned = []
     for m in matches:
@@ -215,11 +230,9 @@ def extract_app_name_from_sentence(text: str) -> str:
         return hashtags[0]
 
     # 2) Remove common noise words and reconstruct app name
-    # Remove punctuation
     cleaned = re.sub(r"[^\w\s]", " ", text)
     words = cleaned.split()
 
-    # Filter out noise words and very short words
     app_words = [
         w for w in words
         if w.lower() not in NOISE_WORDS and len(w) >= 2
@@ -228,19 +241,12 @@ def extract_app_name_from_sentence(text: str) -> str:
     if not app_words:
         return ""
 
-    # Join remaining words as the app name
     return " ".join(app_words)
 
 
 def is_search_request(text: str) -> bool:
     """
     Heuristic: decide if a group message looks like an app search request.
-
-    Returns True if:
-    - Message has a #hashtag, OR
-    - Message contains app-related keywords (apk, app, mod, etc.) alongside
-      other words, OR
-    - Message is a short single word or phrase (not a long conversation)
     """
     text = text.strip()
     if not text or len(text) < 2:
@@ -262,7 +268,6 @@ def is_search_request(text: str) -> bool:
     # Short message (1-4 words) that's not pure noise
     word_count = len(text.split())
     if word_count <= 4:
-        # Check if at least one word is not a noise word
         non_noise = [
             w for w in text.split()
             if w.lower().strip(".,!?;:'\"") not in NOISE_WORDS
@@ -292,6 +297,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "• `remini`\n"
         "• `bhai capcut ka mod dila do`\n"
         "• `I stream flare apk update`\n\n"
+        "📌 I always give the *latest* link for each app.\n\n"
         f"📚 Currently tracking *{count}* channel posts."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -322,12 +328,11 @@ async def channel_post_handler(
     message_id = post.message_id
     link = build_message_link(chat_id, message_id)
 
-    # Extract app name from hashtags
     hashtags = extract_hashtags(text)
     if hashtags:
-        app_name = hashtags[0]  # Use first hashtag as app name
+        app_name = hashtags[0]
     else:
-        app_name = text[:50]  # Use first 50 chars as fallback
+        app_name = text[:50]
 
     store_post(message_id, chat_id, app_name, text, link)
     logger.info(
@@ -358,10 +363,10 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update.effective_chat.id,
     )
 
+    # Search returns only the LATEST post per app name
     results = search_by_app_name(app_query, limit=5)
 
     if not results:
-        # Don't spam — only reply if user used #hashtag (explicit search)
         if HASHTAG_PATTERN.search(message_text):
             await update.message.reply_text(
                 f"❌ No match found for *{escape(app_query)}*.\n"
