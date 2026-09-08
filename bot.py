@@ -14,7 +14,9 @@ import os
 import re
 import logging
 import sqlite3
+import threading
 from html import escape
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -40,12 +42,37 @@ if not BOT_TOKEN:
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+PORT = int(os.getenv("PORT", "10000"))
 
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Keep-alive web server (for Render / Railway free tier)
+# ---------------------------------------------------------------------------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+    def log_message(self, format, *args):
+        pass  # Suppress default HTTP logs
+
+
+def start_keep_alive(port: int) -> None:
+    """Start a minimal HTTP server so Render doesn't kill the service."""
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        logger.info("Keep-alive server listening on port %d", port)
+        server.serve_forever()
+    except OSError as e:
+        logger.warning("Could not start keep-alive server: %s", e)
+
 
 # ---------------------------------------------------------------------------
 # Hashtag & text patterns
@@ -88,23 +115,13 @@ def init_db() -> None:
         )
         """
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_app_name ON channel_posts(app_name)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_full_text ON channel_posts(full_text)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_app_name ON channel_posts(app_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_full_text ON channel_posts(full_text)")
     conn.commit()
     conn.close()
 
 
-def store_post(
-    message_id: int,
-    chat_id: int,
-    app_name: str,
-    full_text: str,
-    link: str,
-) -> None:
+def store_post(message_id, chat_id, app_name, full_text, link):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "INSERT OR REPLACE INTO channel_posts "
@@ -120,15 +137,6 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
     """
     Search channel posts by app name.
     Returns only the LATEST post per app name (deduplicated).
-
-    If the same app has been posted multiple times (e.g. updates in 2023,
-    2024, 2025), only the most recent post is returned — old/expired links
-    are skipped.
-
-    Strategy:
-    1. Exact match on app_name (case-insensitive, spaces removed) — newest first
-    2. If no exact match, try partial LIKE match — newest first
-    3. Deduplicate results by app_name (keep only the latest per app)
     """
     conn = sqlite3.connect(DB_PATH)
     query_clean = query.strip().lower().replace(" ", "")
@@ -214,49 +222,24 @@ def extract_text_from_message(message) -> str:
 
 
 def extract_app_name_from_sentence(text: str) -> str:
-    """
-    Try to extract the app name from a user's message sentence.
-
-    Strategy:
-    1. If there's a #hashtag in the message, use that.
-    2. Otherwise, remove noise words and reconstruct the likely app name
-       from the remaining words.
-    """
     text = text.strip()
-
-    # 1) Check for hashtags
     hashtags = extract_hashtags(text)
     if hashtags:
         return hashtags[0]
-
-    # 2) Remove common noise words and reconstruct app name
     cleaned = re.sub(r"[^\w\s]", " ", text)
     words = cleaned.split()
-
-    app_words = [
-        w for w in words
-        if w.lower() not in NOISE_WORDS and len(w) >= 2
-    ]
-
+    app_words = [w for w in words if w.lower() not in NOISE_WORDS and len(w) >= 2]
     if not app_words:
         return ""
-
     return " ".join(app_words)
 
 
 def is_search_request(text: str) -> bool:
-    """
-    Heuristic: decide if a group message looks like an app search request.
-    """
     text = text.strip()
     if not text or len(text) < 2:
         return False
-
-    # Has #hashtag → definitely a search
     if HASHTAG_PATTERN.search(text):
         return True
-
-    # Contains app-related keywords
     text_lower = text.lower()
     app_keywords = {"apk", "app", "mod", "update", "link", "download",
                     "latest", "version", "chahiye", "chahiya", "dila",
@@ -264,8 +247,6 @@ def is_search_request(text: str) -> bool:
     words = set(re.sub(r"[^\w\s]", " ", text_lower).split())
     if app_keywords & words:
         return True
-
-    # Short message (1-4 words) that's not pure noise
     word_count = len(text.split())
     if word_count <= 4:
         non_noise = [
@@ -275,7 +256,6 @@ def is_search_request(text: str) -> bool:
         ]
         if non_noise:
             return True
-
     return False
 
 
@@ -317,55 +297,40 @@ async def channel_post_handler(
     """Store new channel posts — extract #AppName as the search key."""
     if not update.channel_post:
         return
-
     post = update.channel_post
     text = extract_text_from_message(post)
-
     if not text:
         return
-
     chat_id = post.chat.id
     message_id = post.message_id
     link = build_message_link(chat_id, message_id)
-
     hashtags = extract_hashtags(text)
     if hashtags:
         app_name = hashtags[0]
     else:
         app_name = text[:50]
-
     store_post(message_id, chat_id, app_name, text, link)
     logger.info(
         "Stored channel post %s — app: %s (text: %.50s...)",
-        message_id,
-        app_name,
-        text,
+        message_id, app_name, text,
     )
 
 
 async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Main group handler: detect app name in messages and search."""
     message_text = update.message.text or ""
-
     if not is_search_request(message_text):
         return
-
     app_query = extract_app_name_from_sentence(message_text)
-
     if not app_query or len(app_query) < 2:
         return
-
     logger.info(
         "Searching for: '%s' (extracted from: '%s') — user: %s, chat: %s",
-        app_query,
-        message_text,
+        app_query, message_text,
         update.effective_user.username or update.effective_user.id,
         update.effective_chat.id,
     )
-
-    # Search returns only the LATEST post per app name
     results = search_by_app_name(app_query, limit=5)
-
     if not results:
         if HASHTAG_PATTERN.search(message_text):
             await update.message.reply_text(
@@ -374,7 +339,6 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="Markdown",
             )
         return
-
     if len(results) == 1:
         post = results[0]
         preview = (post["text"] or "")[:120]
@@ -414,6 +378,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ---------------------------------------------------------------------------
 def main() -> None:
     init_db()
+
+    # Start keep-alive server in a background thread (for Render)
+    keep_alive_thread = threading.Thread(
+        target=start_keep_alive, args=(PORT,), daemon=True
+    )
+    keep_alive_thread.start()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
