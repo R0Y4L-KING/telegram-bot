@@ -6,11 +6,12 @@ When a user in a group mentions an app name, the bot searches the
 channel database and replies with a direct link to the LATEST post.
 
 Auto-import: On first startup (or after database reset), the bot
-automatically imports existing channel history using Pyrogram.
+automatically imports existing channel history using Pyrogram (async).
 """
 
 import os
 import re
+import asyncio
 import logging
 import sqlite3
 import threading
@@ -44,7 +45,6 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Telegram API credentials (for auto-import)
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 
@@ -55,7 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Keep-alive web server (for Render / Railway)
+# Keep-alive web server (for Render)
 # ---------------------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -78,7 +78,7 @@ def start_keep_alive(port: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Hashtag & text patterns
+# Patterns
 # ---------------------------------------------------------------------------
 HASHTAG_PATTERN = re.compile(r"#([a-zA-Z0-9][a-zA-Z0-9 _]{1,40})", re.IGNORECASE)
 
@@ -148,7 +148,6 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
     conn = sqlite3.connect(DB_PATH)
     query_clean = query.strip().lower().replace(" ", "")
 
-    # 1) Exact match (newest first)
     cursor = conn.execute(
         "SELECT app_name, full_text, link, message_id FROM channel_posts "
         "WHERE LOWER(REPLACE(app_name, ' ', '')) = ? "
@@ -160,7 +159,6 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
         for r in cursor.fetchall()
     ]
 
-    # 2) Partial / LIKE match (newest first)
     if not results:
         like_query = f"%{query.strip().lower()}%"
         cursor = conn.execute(
@@ -176,7 +174,6 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
 
     conn.close()
 
-    # 3) Deduplicate: keep only LATEST post per app_name
     seen_apps = set()
     deduped = []
     for post in results:
@@ -208,7 +205,7 @@ def build_message_link(chat_id: int, message_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Text extraction & parsing
+# Text extraction
 # ---------------------------------------------------------------------------
 def extract_hashtags(text: str) -> list:
     matches = HASHTAG_PATTERN.findall(text)
@@ -267,10 +264,9 @@ def is_search_request(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Auto-import channel history
+# Auto-import channel history (ASYNC — Pyrogram 2.x)
 # ---------------------------------------------------------------------------
 def get_channel_target():
-    """Determine the channel to import from."""
     if CHANNEL_USERNAME:
         return CHANNEL_USERNAME
     if CHANNEL_ID:
@@ -278,33 +274,33 @@ def get_channel_target():
     return None
 
 
-def auto_import_history():
+async def auto_import_history_async():
     """
-    Automatically import all existing channel posts into the database.
-    Uses Pyrogram (MTProto API) to read channel history.
-    Runs on startup if the database is empty.
+    Async version: Import all existing channel posts using Pyrogram 2.x.
+    Pyrogram 2.x is fully async — client.start(), get_chat_history(),
+    and client.stop() are all coroutines/async generators.
     """
     if not API_ID or not API_HASH:
         logger.warning(
             "API_ID/API_HASH not set — skipping auto-import. "
             "Bot will only track NEW channel posts."
         )
-        return
+        return 0
 
     channel_target = get_channel_target()
     if not channel_target:
         logger.warning(
             "CHANNEL_USERNAME or CHANNEL_ID not set — skipping auto-import."
         )
-        return
+        return 0
 
     try:
         from pyrogram import Client
     except ImportError:
         logger.error("Pyrogram not installed! Run: pip install pyrogram tgcrypto")
-        return
+        return 0
 
-    logger.info("Starting auto-import of channel history...")
+    logger.info("Starting auto-import of channel history (async)...")
     imported = 0
     skipped = 0
 
@@ -317,39 +313,51 @@ def auto_import_history():
             in_memory=True,
         )
 
-        with client:
-            for message in client.get_chat_history(channel_target):
-                text = message.text or message.caption or ""
-                if not text:
-                    skipped += 1
-                    continue
+        await client.start()
+        logger.info("Pyrogram client started, reading channel history...")
 
-                chat_id = message.chat.id
-                message_id = message.id
-                link = build_message_link(chat_id, message_id)
+        async for message in client.get_chat_history(channel_target):
+            text = message.text or message.caption or ""
+            if not text:
+                skipped += 1
+                continue
 
-                hashtags = extract_hashtags(text)
-                if hashtags:
-                    app_name = hashtags[0]
-                else:
-                    skipped += 1
-                    continue
+            chat_id = message.chat.id
+            message_id = message.id
+            link = build_message_link(chat_id, message_id)
 
-                # Use message date for accurate created_at
-                created_at = message.date.isoformat() if message.date else None
+            hashtags = extract_hashtags(text)
+            if hashtags:
+                app_name = hashtags[0]
+            else:
+                skipped += 1
+                continue
 
-                store_post(message_id, chat_id, app_name, text, link, created_at)
-                imported += 1
+            created_at = message.date.isoformat() if message.date else None
+            store_post(message_id, chat_id, app_name, text, link, created_at)
+            imported += 1
 
-                if imported % 100 == 0:
-                    logger.info("Auto-import: %d posts imported so far...", imported)
+            if imported % 100 == 0:
+                logger.info("Auto-import: %d posts imported so far...", imported)
 
+        await client.stop()
         logger.info(
             "✅ Auto-import complete! Imported: %d posts, Skipped: %d",
             imported, skipped,
         )
     except Exception as e:
         logger.error("Auto-import failed: %s", e)
+        try:
+            await client.stop()
+        except Exception:
+            pass
+
+    return imported
+
+
+def auto_import_history_sync():
+    """Wrapper to run async import from sync context (for /import command)."""
+    asyncio.run(auto_import_history_async())
 
 
 # ---------------------------------------------------------------------------
@@ -386,17 +394,16 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually trigger channel history import."""
-    # Only allow admins to run this
-    user = update.effective_user
-    if not user:
-        return
-
     await update.message.reply_text(
         "⏳ Importing channel history... This may take a few minutes."
     )
 
-    # Run import in background
-    threading.Thread(target=auto_import_history, daemon=True).start()
+    # Run async import in a background thread
+    def run_import():
+        asyncio.run(auto_import_history_async())
+
+    thread = threading.Thread(target=run_import, daemon=True)
+    thread.start()
 
     count = get_post_count()
     await update.message.reply_text(
@@ -409,7 +416,6 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def channel_post_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Store new channel posts — extract #AppName as the search key."""
     if not update.channel_post:
         return
     post = update.channel_post
@@ -432,7 +438,6 @@ async def channel_post_handler(
 
 
 async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Main group handler: detect app name in messages and search."""
     message_text = update.message.text or ""
     if not is_search_request(message_text):
         return
@@ -489,11 +494,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_init(application: Application) -> None:
-    """Run after the bot is initialized but before polling starts."""
+    """Run after bot init but before polling — auto-import if DB is empty."""
     count = get_post_count()
     if count == 0:
         logger.info("Database is empty — running auto-import...")
-        auto_import_history()
+        await auto_import_history_async()
     else:
         logger.info("Database has %d posts — skipping auto-import.", count)
 
@@ -504,7 +509,6 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     init_db()
 
-    # Start keep-alive server in a background thread (for Render)
     keep_alive_thread = threading.Thread(
         target=start_keep_alive, args=(PORT,), daemon=True
     )
@@ -512,18 +516,14 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("import", import_command))
 
-    # Channel post handler
     app.add_handler(
         MessageHandler(filters.UpdateType.CHANNEL_POSTS, channel_post_handler)
     )
-
-    # Group message handler
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
