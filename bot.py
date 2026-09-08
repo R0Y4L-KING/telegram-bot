@@ -6,7 +6,8 @@ When a user in a group mentions an app name, the bot searches the
 channel database and replies with a direct link to the LATEST post.
 
 Auto-import: On first startup (or after database reset), the bot
-automatically imports existing channel history using Pyrogram (async).
+automatically imports existing channel history using a user session
+string (bots can't read channel history directly).
 """
 
 import os
@@ -47,6 +48,7 @@ PORT = int(os.getenv("PORT", "10000"))
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
 
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
@@ -264,7 +266,7 @@ def is_search_request(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Auto-import channel history (ASYNC — Pyrogram 2.x)
+# Auto-import channel history (using USER session, not bot token)
 # ---------------------------------------------------------------------------
 def get_channel_target():
     if CHANNEL_USERNAME:
@@ -276,15 +278,23 @@ def get_channel_target():
 
 async def auto_import_history_async():
     """
-    Async version: Import all existing channel posts using Pyrogram 2.x.
-    Pyrogram 2.x is fully async — client.start(), get_chat_history(),
-    and client.stop() are all coroutines/async generators.
+    Import all existing channel posts using a user session string.
+    Bots cannot read channel history (Telegram API restriction),
+    so we use a user session string for the import.
+
+    The bot token is still used for normal operations (polling,
+    responding to group messages, receiving new channel posts).
     """
-    if not API_ID or not API_HASH:
+    if not SESSION_STRING:
         logger.warning(
-            "API_ID/API_HASH not set — skipping auto-import. "
-            "Bot will only track NEW channel posts."
+            "SESSION_STRING not set — skipping auto-import. "
+            "Run generate_session.py locally to get a session string, "
+            "then add it to your environment variables."
         )
+        return 0
+
+    if not API_ID or not API_HASH:
+        logger.warning("API_ID/API_HASH not set — skipping auto-import.")
         return 0
 
     channel_target = get_channel_target()
@@ -300,21 +310,22 @@ async def auto_import_history_async():
         logger.error("Pyrogram not installed! Run: pip install pyrogram tgcrypto")
         return 0
 
-    logger.info("Starting auto-import of channel history (async)...")
+    logger.info("Starting auto-import using user session string...")
     imported = 0
     skipped = 0
 
     try:
+        # Use USER session (not bot token) — bots can't read history
         client = Client(
-            "bot_auto_import",
+            "bot_user_session",
             api_id=API_ID,
             api_hash=API_HASH,
-            bot_token=BOT_TOKEN,
+            session_string=SESSION_STRING,
             in_memory=True,
         )
 
         await client.start()
-        logger.info("Pyrogram client started, reading channel history...")
+        logger.info("Pyrogram user session started, reading channel history...")
 
         async for message in client.get_chat_history(channel_target):
             text = message.text or message.caption or ""
@@ -355,11 +366,6 @@ async def auto_import_history_async():
     return imported
 
 
-def auto_import_history_sync():
-    """Wrapper to run async import from sync context (for /import command)."""
-    asyncio.run(auto_import_history_async())
-
-
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -394,11 +400,18 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually trigger channel history import."""
+    if not SESSION_STRING:
+        await update.message.reply_text(
+            "❌ Import not available.\n"
+            "Session string not configured. "
+            "Run generate_session.py locally first."
+        )
+        return
+
     await update.message.reply_text(
         "⏳ Importing channel history... This may take a few minutes."
     )
 
-    # Run async import in a background thread
     def run_import():
         asyncio.run(auto_import_history_async())
 
