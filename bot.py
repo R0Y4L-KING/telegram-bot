@@ -1,8 +1,10 @@
 """
-Telegram Group Helper Bot
-Monitors a Telegram channel for posts and stores them in a database.
-When a user in a group types an app name, the bot searches the channel
-posts and replies with a direct link to the matching post.
+Telegram Group Helper Bot — Channel APK Search
+=============================================
+Monitors a Telegram channel for posts containing #AppName tags.
+When a user in a group mentions an app name (single word, hashtag,
+or full sentence), the bot searches the channel database and replies
+with a direct link to the matching channel post.
 """
 
 import os
@@ -33,56 +35,43 @@ if not BOT_TOKEN:
         "Get a token from @BotFather on Telegram."
     )
 
-# Channel username (without @) — for building public message links.
-# Leave empty if the channel is private; the bot will use the private link format.
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "")  # e.g. -1001234567890
-
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 
-# Logging
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# Common words to ignore — these should NOT trigger a search.
-IGNORE_WORDS = frozenset({
-    "hi", "hello", "hey", "ok", "okay", "yes", "no", "lol", "haha",
-    "thanks", "thank", "thx", "pls", "please", "sorry", "bye", "gn",
-    "gm", "good", "morning", "night", "what", "why", "how", "who",
-    "where", "when", "kya", "hai", "hain", "nahi", "haan", "bhai",
-    "bro", "dude", "mate", "yo", "sup", "wow", "nice", "cool", "great",
-    "the", "and", "for", "are", "you", "all", "can", "get", "got",
-    "this", "that", "was", "has", "had", "but", "not", "will", "just",
-    "dont", "cant", "wont", "ill", "youre", "they", "them", "here",
-    "there", "now", "then", "one", "two", "also", "very", "much",
-    "any", "some", "more", "out", "about", "into", "from", "with",
-    "have", "your", "been", "were", "said", "each", "which", "their",
-    "would", "could", "should", "stop", "wait", "let", "me", "my",
-    "we", "us", "our", "he", "she", "it", "is", "am", "do", "so",
-    "if", "or", "as", "at", "by", "in", "on", "to", "up", "of",
-    "a", "an", "go", "no", "bot", "admin", "mod", "owner", "group",
-    "channel", "link", "send", "give", "take", "make", "find",
-    "search", "help", "start", "begin", "end", "pause", "play",
-    "next", "prev", "back", "forward", "left", "right", "down",
-    "top", "bottom", "chat", "msg", "text", "call", "video",
-    "audio", "photo", "pic", "image", "file", "doc", "pdf", "zip",
-    "apk", "app", "download", "upload", "share", "copy", "paste",
-    "delete", "remove", "add", "new", "old", "best", "worst",
-    "free", "paid", "pro", "lite", "beta", "alpha", "test", "demo",
-    "trial", "full", "final", "version", "update", "install",
-    "uninstall", "setup", "run", "code", "script", "tool", "site",
-    "website", "blog", "page", "post", "reply", "comment", "like",
-    "love", "hate", "want", "need", "wish", "hope", "try", "use",
-    "using", "used", "getting", "going", "coming", "looking",
-    "finding", "trying", "making", "doing", "saying", "talking",
-    "asking", "telling", "knowing", "thinking", "feeling", "seeing",
-    "hearing", "reading", "writing", "typing", "k", "kk", "okayy",
-    "hlo", "hii", "helo", "helloo", "namaste", "namaskar", "salaam",
-    "salam", "adaab", "hmm", "hmmm", "oh", "ah", "uff", "wow",
-    "nice", "good", "bad", "fine", "ok", "okay", "alright",
+# ---------------------------------------------------------------------------
+# Hashtag & text patterns
+# ---------------------------------------------------------------------------
+# Matches #AppName (letters, numbers, spaces allowed between words)
+# Examples: #QuickTv, #Remini, #IstreamFlare, #I Stream Flare
+HASHTAG_PATTERN = re.compile(r"#([a-zA-Z0-9][a-zA-Z0-9 _]{1,40})", re.IGNORECASE)
+
+# Words that are NOT app names — used to clean up sentences
+NOISE_WORDS = frozenset({
+    # Common Hindi/English filler words
+    "bhai", "bro", "dude", "mate", "yo", "pls", "please", "kya", "hai",
+    "hain", "nahi", "haan", "ka", "ki", "ke", "ko", "me", "mein", "se",
+    "par", "aur", "ya", "to", "bhi", "hi", "tha", "thi", "the", "ho",
+    "de", "do", "dila", "dilado", "dilado", "chahiye", "chahiya",
+    "mujhe", "muje", "mujhko", "hamko", "humko", "merako",
+    # APK / app related request words
+    "apk", "app", "mod", "update", "krdo", "kar", "karo", "dena", "de do",
+    "bhejo", "send", "link", "download", "latest", "new", "old", "version",
+    # Common English stopwords
+    "the", "a", "an", "is", "am", "are", "was", "were", "be", "been",
+    "and", "or", "but", "if", "so", "for", "of", "to", "in", "on", "at",
+    "by", "with", "from", "this", "that", "it", "as",
+    # Greetings
+    "hi", "hello", "hey", "hlo", "hii", "helo", "namaste", "namaskar",
+    "ok", "okay", "thanks", "thank", "thx", "sorry", "bye",
+    # Misc
+    "bot", "admin", "group", "channel", "k", "kk", "hmm", "hmmm",
+    "wow", "nice", "cool", "good", "bad", "fine", "great",
 })
 
 
@@ -90,7 +79,6 @@ IGNORE_WORDS = frozenset({
 # Database
 # ---------------------------------------------------------------------------
 def init_db() -> None:
-    """Create the database table if it does not exist."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
@@ -98,47 +86,75 @@ def init_db() -> None:
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             message_id  INTEGER NOT NULL,
             chat_id     INTEGER NOT NULL,
-            text        TEXT,
+            app_name    TEXT,
+            full_text   TEXT,
             link        TEXT,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_text ON channel_posts(text)"
+        "CREATE INDEX IF NOT EXISTS idx_app_name ON channel_posts(app_name)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_full_text ON channel_posts(full_text)"
     )
     conn.commit()
     conn.close()
 
 
-def store_post(message_id: int, chat_id: int, text: str, link: str) -> None:
-    """Store a channel post in the database."""
+def store_post(
+    message_id: int,
+    chat_id: int,
+    app_name: str,
+    full_text: str,
+    link: str,
+) -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT OR REPLACE INTO channel_posts (message_id, chat_id, text, link) "
-        "VALUES (?, ?, ?, ?)",
-        (message_id, chat_id, text, link),
+        "INSERT OR REPLACE INTO channel_posts "
+        "(message_id, chat_id, app_name, full_text, link) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (message_id, chat_id, app_name, full_text, link),
     )
     conn.commit()
     conn.close()
 
 
-def search_posts(query: str, limit: int = 5) -> list:
+def search_by_app_name(query: str, limit: int = 5) -> list:
     """
-    Search channel posts by text.
-    Returns a list of dicts with keys: text, link, message_id.
+    Search channel posts by app name.
+    Tries exact match first, then partial match.
     """
     conn = sqlite3.connect(DB_PATH)
+    query_clean = query.strip().lower().replace(" ", "")
+
+    # 1) Exact match on app_name (case-insensitive, spaces removed)
     cursor = conn.execute(
-        "SELECT text, link, message_id FROM channel_posts "
-        "WHERE text LIKE ? COLLATE NOCASE "
+        "SELECT app_name, full_text, link, message_id FROM channel_posts "
+        "WHERE LOWER(REPLACE(app_name, ' ', '')) = ? "
         "ORDER BY created_at DESC LIMIT ?",
-        (f"%{query}%", limit),
+        (query_clean, limit),
     )
     results = [
-        {"text": row[0], "link": row[1], "message_id": row[2]}
-        for row in cursor.fetchall()
+        {"app_name": r[0], "text": r[1], "link": r[2], "message_id": r[3]}
+        for r in cursor.fetchall()
     ]
+
+    # 2) If no exact match, try partial / LIKE match
+    if not results:
+        like_query = f"%{query.strip().lower()}%"
+        cursor = conn.execute(
+            "SELECT app_name, full_text, link, message_id FROM channel_posts "
+            "WHERE LOWER(app_name) LIKE ? OR LOWER(full_text) LIKE ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (like_query, like_query, limit),
+        )
+        results = [
+            {"app_name": r[0], "text": r[1], "link": r[2], "message_id": r[3]}
+            for r in cursor.fetchall()
+        ]
+
     conn.close()
     return results
 
@@ -152,95 +168,139 @@ def get_post_count() -> int:
 
 
 def build_message_link(chat_id: int, message_id: int) -> str:
-    """
-    Build a Telegram link to a channel post.
-    - Public channel with username: https://t.me/{username}/{message_id}
-    - Private channel: https://t.me/c/{chat_id_without_prefix}/{message_id}
-    """
     if CHANNEL_USERNAME:
         return f"https://t.me/{CHANNEL_USERNAME}/{message_id}"
-
-    # For private channels, chat_id is like -1001234567890
-    # The link format uses the positive part without the -100 prefix
     if chat_id < 0:
-        # Remove the -100 prefix for private supergroups/channels
         positive_id = str(chat_id).replace("-100", "", 1)
         return f"https://t.me/c/{positive_id}/{message_id}"
-
     return f"https://t.me/c/{chat_id}/{message_id}"
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Text extraction & parsing
 # ---------------------------------------------------------------------------
-def is_likely_app_name(text: str) -> bool:
-    """
-    Heuristic: decide if a message looks like an app-name search.
-    - Must be a single word (no spaces).
-    - At least 3 characters.
-    - Mostly alphabetic.
-    - Not a common word.
-    """
-    text = text.strip()
-
-    if not text or " " in text or len(text) < 3:
-        return False
-
-    alpha_count = sum(1 for c in text if c.isalpha())
-    if alpha_count < len(text) * 0.5:
-        return False
-
-    # Strip common trailing punctuation
-    cleaned = text.rstrip(".,!?;:'\"")
-    if cleaned.lower() in IGNORE_WORDS:
-        return False
-
-    return True
+def extract_hashtags(text: str) -> list:
+    """Extract all #AppName tags from text. Returns list of cleaned names."""
+    matches = HASHTAG_PATTERN.findall(text)
+    cleaned = []
+    for m in matches:
+        name = m.strip()
+        if name and len(name) >= 2:
+            cleaned.append(name)
+    return cleaned
 
 
 def extract_text_from_message(message) -> str:
-    """Extract text content from a Telegram message (caption, text, or forwarded)."""
     if message.text:
         return message.text
     if message.caption:
         return message.caption
-    if message.forward_origin:
-        # Try to get text from forwarded message
-        if hasattr(message, "text") and message.text:
-            return message.text
-        if hasattr(message, "caption") and message.caption:
-            return message.caption
     return ""
+
+
+def extract_app_name_from_sentence(text: str) -> str:
+    """
+    Try to extract the app name from a user's message sentence.
+
+    Strategy:
+    1. If there's a #hashtag in the message, use that.
+    2. Otherwise, remove noise words and reconstruct the likely app name
+       from the remaining words.
+    """
+    text = text.strip()
+
+    # 1) Check for hashtags
+    hashtags = extract_hashtags(text)
+    if hashtags:
+        return hashtags[0]
+
+    # 2) Remove common noise words and reconstruct app name
+    # Remove punctuation
+    cleaned = re.sub(r"[^\w\s]", " ", text)
+    words = cleaned.split()
+
+    # Filter out noise words and very short words
+    app_words = [
+        w for w in words
+        if w.lower() not in NOISE_WORDS and len(w) >= 2
+    ]
+
+    if not app_words:
+        return ""
+
+    # Join remaining words as the app name
+    return " ".join(app_words)
+
+
+def is_search_request(text: str) -> bool:
+    """
+    Heuristic: decide if a group message looks like an app search request.
+
+    Returns True if:
+    - Message has a #hashtag, OR
+    - Message contains app-related keywords (apk, app, mod, etc.) alongside
+      other words, OR
+    - Message is a short single word or phrase (not a long conversation)
+    """
+    text = text.strip()
+    if not text or len(text) < 2:
+        return False
+
+    # Has #hashtag → definitely a search
+    if HASHTAG_PATTERN.search(text):
+        return True
+
+    # Contains app-related keywords
+    text_lower = text.lower()
+    app_keywords = {"apk", "app", "mod", "update", "link", "download",
+                    "latest", "version", "chahiye", "chahiya", "dila",
+                    "dilado", "bhejo", "dena", "dedo", "krdo", "karo"}
+    words = set(re.sub(r"[^\w\s]", " ", text_lower).split())
+    if app_keywords & words:
+        return True
+
+    # Short message (1-4 words) that's not pure noise
+    word_count = len(text.split())
+    if word_count <= 4:
+        # Check if at least one word is not a noise word
+        non_noise = [
+            w for w in text.split()
+            if w.lower().strip(".,!?;:'\"") not in NOISE_WORDS
+            and len(w.strip(".,!?;:'\"")) >= 2
+        ]
+        if non_noise:
+            return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start and /help commands."""
     count = get_post_count()
     text = (
         "👋 *Hello!*\n\n"
-        "I'm a *Channel Search Bot*.\n\n"
+        "I'm a *Channel APK Search Bot*.\n\n"
         "📋 *How to use:*\n"
-        "Just type an app name in the group and I'll search for it "
-        "in the linked channel and give you the direct post link.\n\n"
+        "• Type an app name and I'll find it in the channel\n"
+        "• You can use `#AppName` or just type the name\n"
+        "• You can also type a full sentence like: "
+        "`bhai remini ka apk update krdo pls`\n\n"
         "✨ *Examples:*\n"
-        "• `remini` — Find Remini post\n"
-        "• `capcut` — Find CapCut post\n"
-        "• `truecaller` — Find Truecaller post\n\n"
-        f"📚 Currently tracking *{count}* channel posts.\n\n"
-        "⚠️ I only respond to single-word searches, not full sentences."
+        "• `#QuickTv`\n"
+        "• `remini`\n"
+        "• `bhai capcut ka mod dila do`\n"
+        "• `I stream flare apk update`\n\n"
+        f"📚 Currently tracking *{count}* channel posts."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /stats command — show database stats."""
     count = get_post_count()
     await update.message.reply_text(
-        f"📊 *Bot Statistics*\n\n"
-        f"📚 Total channel posts indexed: *{count}*",
+        f"📊 *Bot Statistics*\n\n📚 Total channel posts: *{count}*",
         parse_mode="Markdown",
     )
 
@@ -248,10 +308,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def channel_post_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """
-    Handle new channel posts — store them in the database.
-    This runs automatically when the bot is an admin in the channel.
-    """
+    """Store new channel posts — extract #AppName as the search key."""
     if not update.channel_post:
         return
 
@@ -265,47 +322,61 @@ async def channel_post_handler(
     message_id = post.message_id
     link = build_message_link(chat_id, message_id)
 
-    store_post(message_id, chat_id, text, link)
+    # Extract app name from hashtags
+    hashtags = extract_hashtags(text)
+    if hashtags:
+        app_name = hashtags[0]  # Use first hashtag as app name
+    else:
+        app_name = text[:50]  # Use first 50 chars as fallback
+
+    store_post(message_id, chat_id, app_name, text, link)
     logger.info(
-        "Stored channel post %s from chat %s (text: %.50s...)",
+        "Stored channel post %s — app: %s (text: %.50s...)",
         message_id,
-        chat_id,
+        app_name,
         text,
     )
 
 
 async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    When a user types a single word in the group, search the channel
-    post database and reply with matching post links.
-    """
+    """Main group handler: detect app name in messages and search."""
     message_text = update.message.text or ""
 
-    # Clean trailing punctuation
-    cleaned = message_text.strip().rstrip(".,!?;:'\"")
-
-    if not is_likely_app_name(cleaned):
+    if not is_search_request(message_text):
         return
 
-    app_query = cleaned
+    app_query = extract_app_name_from_sentence(message_text)
+
+    if not app_query or len(app_query) < 2:
+        return
+
     logger.info(
-        "Searching for: %s (user: %s, chat: %s)",
+        "Searching for: '%s' (extracted from: '%s') — user: %s, chat: %s",
         app_query,
+        message_text,
         update.effective_user.username or update.effective_user.id,
         update.effective_chat.id,
     )
 
-    results = search_posts(app_query, limit=5)
+    results = search_by_app_name(app_query, limit=5)
 
     if not results:
-        # Don't spam — silently ignore if no match
+        # Don't spam — only reply if user used #hashtag (explicit search)
+        if HASHTAG_PATTERN.search(message_text):
+            await update.message.reply_text(
+                f"❌ No match found for *{escape(app_query)}*.\n"
+                f"This app might not be in the channel yet.",
+                parse_mode="Markdown",
+            )
         return
 
     if len(results) == 1:
         post = results[0]
-        preview = post["text"][:100] + ("..." if len(post["text"]) > 100 else "")
+        preview = (post["text"] or "")[:120]
+        if len(post["text"] or "") > 120:
+            preview += "..."
         reply = (
-            f"📱 *Found a match for* `{escape(app_query)}`:\n\n"
+            f"📱 *{escape(post['app_name'] or app_query)}*\n\n"
             f"📝 {escape(preview)}\n\n"
             f"🔗 [Open Post]({post['link']})"
         )
@@ -315,15 +386,21 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         lines = [f"📱 *Found {len(results)} matches for* `{escape(app_query)}`:\n"]
         for i, post in enumerate(results, 1):
-            preview = post["text"][:60] + ("..." if len(post["text"]) > 60 else "")
-            lines.append(f"{i}. {escape(preview)}\n   🔗 [Open]({post['link']})")
+            preview = (post["text"] or "")[:60]
+            if len(post["text"] or "") > 60:
+                preview += "..."
+            lines.append(
+                f"{i}. *{escape(post['app_name'] or 'Unknown')}*\n"
+                f"   {escape(preview)}\n"
+                f"   🔗 [Open]({post['link']})"
+            )
         await update.message.reply_text(
-            "\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True
+            "\n".join(lines), parse_mode="Markdown",
+            disable_web_page_preview=True
         )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors."""
     logger.error("Exception: %s", context.error)
 
 
@@ -331,7 +408,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    """Start the bot."""
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -341,12 +417,12 @@ def main() -> None:
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("stats", stats_command))
 
-    # Channel post handler — stores new posts from the channel
+    # Channel post handler
     app.add_handler(
         MessageHandler(filters.UpdateType.CHANNEL_POSTS, channel_post_handler)
     )
 
-    # Group message handler — search when user types a single word
+    # Group message handler
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
@@ -354,7 +430,6 @@ def main() -> None:
         )
     )
 
-    # Error handler
     app.add_error_handler(error_handler)
 
     logger.info("Bot is starting... Press Ctrl+C to stop.")
