@@ -1,10 +1,17 @@
 """
-Telegram Group Helper Bot — Channel APK Search with Gemini AI
-=============================================================
-Monitors a Telegram channel for posts containing #AppName tags.
-When a user in a group mentions an app name, the bot uses Gemini AI
-to extract the app name from the message, then searches the channel
-database and replies with a direct link to the LATEST post.
+MODAPPSKING Search Bot with AI
+==============================
+A Telegram bot that monitors multiple channels for posts containing
+#AppName tags. When a user in a group mentions an app name, the bot
+uses Gemini AI to extract the app name, searches all configured channels,
+and replies with a direct link to the LATEST post.
+
+Features:
+- Multiple channel support (comma-separated CHANNEL_IDS)
+- Gemini AI smart app name extraction (spelling mistakes, Hinglish)
+- Auto-import channel history using Telethon user session
+- Self-ping keep-alive to reduce Render sleep
+- Latest post only (deduplication across channels)
 """
 
 import os
@@ -39,8 +46,15 @@ if not BOT_TOKEN:
         "Get a token from @BotFather on Telegram."
     )
 
+# Channel configuration — supports MULTIPLE channels
+# PUBLIC channels: comma-separated usernames (without @)
+# Example: my_channel1,my_channel2
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
+
+# PRIVATE channels: comma-separated channel IDs
+# Example: -1001234567890,-1009876543210
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -65,7 +79,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(b"MODAPPSKING Search Bot is running!")
 
     def log_message(self, format, *args):
         pass
@@ -124,6 +138,36 @@ NOISE_WORDS = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Channel management — supports MULTIPLE channels
+# ---------------------------------------------------------------------------
+def get_channel_targets():
+    """
+    Parse CHANNEL_ID and CHANNEL_USERNAME env vars.
+    Returns a list of channel targets (ints for private, strings for public).
+    """
+    targets = []
+
+    # Parse comma-separated channel IDs (private channels)
+    if CHANNEL_ID:
+        for cid in CHANNEL_ID.split(","):
+            cid = cid.strip()
+            if cid:
+                try:
+                    targets.append(int(cid))
+                except ValueError:
+                    logger.warning("Invalid CHANNEL_ID entry: %s", cid)
+
+    # Parse comma-separated usernames (public channels)
+    if CHANNEL_USERNAME:
+        for uname in CHANNEL_USERNAME.split(","):
+            uname = uname.strip()
+            if uname:
+                targets.append(uname)
+
+    return targets
+
+
+# ---------------------------------------------------------------------------
 # Gemini AI — Smart app name extraction
 # ---------------------------------------------------------------------------
 _gemini_model = None
@@ -139,7 +183,6 @@ def init_gemini():
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
 
-        # Auto-detect available model — try multiple names
         model_names = [
             "gemini-2.0-flash",
             "gemini-1.5-flash",
@@ -167,7 +210,6 @@ def init_gemini():
                 continue
 
         if not selected_model:
-            # Last resort: list available models from API
             try:
                 logger.info("Trying to list available models from Gemini API...")
                 for m in genai.list_models():
@@ -210,7 +252,6 @@ def init_gemini():
             ),
         )
 
-        # Final test with system instruction
         test_response = _gemini_model.generate_content("Test: what is 2+2?")
         logger.info("✅ Gemini AI fully initialized and tested. Model: %s", selected_model)
         return True
@@ -403,8 +444,14 @@ def get_post_count() -> int:
 
 
 def build_message_link(chat_id: int, message_id: int) -> str:
+    # Check if this chat_id matches a configured public channel
     if CHANNEL_USERNAME:
-        return f"https://t.me/{CHANNEL_USERNAME}/{message_id}"
+        for uname in CHANNEL_USERNAME.split(","):
+            uname = uname.strip()
+            if uname:
+                return f"https://t.me/{uname}/{message_id}"
+
+    # Private channel link format
     if chat_id < 0:
         positive_id = str(chat_id).replace("-100", "", 1)
         return f"https://t.me/c/{positive_id}/{message_id}"
@@ -471,16 +518,8 @@ def is_search_request(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Auto-import channel history (Telethon)
+# Auto-import channel history (Telethon) — supports MULTIPLE channels
 # ---------------------------------------------------------------------------
-def get_channel_target():
-    if CHANNEL_USERNAME:
-        return CHANNEL_USERNAME
-    if CHANNEL_ID:
-        return int(CHANNEL_ID)
-    return None
-
-
 async def auto_import_history_async():
     if not SESSION_STRING:
         logger.warning(
@@ -493,9 +532,9 @@ async def auto_import_history_async():
         logger.warning("API_ID/API_HASH not set — skipping auto-import.")
         return 0
 
-    channel_target = get_channel_target()
-    if not channel_target:
-        logger.warning("CHANNEL_USERNAME or CHANNEL_ID not set — skipping.")
+    targets = get_channel_targets()
+    if not targets:
+        logger.warning("No channels configured (CHANNEL_ID or CHANNEL_USERNAME not set).")
         return 0
 
     try:
@@ -505,59 +544,72 @@ async def auto_import_history_async():
         logger.error("Telethon not installed! Run: pip install telethon")
         return 0
 
-    logger.info("Starting auto-import using Telethon user session...")
-    imported = 0
-    skipped = 0
+    total_imported = 0
+    total_skipped = 0
 
-    client = None
-    try:
-        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-        await client.start()
-        logger.info("Telethon user session started, reading channel history...")
+    for target in targets:
+        logger.info("Starting auto-import for channel: %s", target)
+        imported = 0
+        skipped = 0
 
-        entity = await client.get_entity(channel_target)
-        logger.info("Resolved channel entity: %s", getattr(entity, 'title', str(channel_target)))
+        client = None
+        try:
+            client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+            await client.start()
+            logger.info("Telethon user session started, reading channel history...")
 
-        async for message in client.iter_messages(entity):
-            text = message.text or message.message or ""
-            if not text:
-                skipped += 1
-                continue
+            entity = await client.get_entity(target)
+            channel_title = getattr(entity, 'title', str(target))
+            logger.info("Resolved channel entity: %s", channel_title)
 
-            chat_id = message.chat_id or message.peer_id.channel_id
-            if hasattr(message.peer_id, 'channel_id'):
-                chat_id = -1000000000000 - message.peer_id.channel_id
-            message_id = message.id
-            link = build_message_link(chat_id, message_id)
+            async for message in client.iter_messages(entity):
+                text = message.text or message.message or ""
+                if not text:
+                    skipped += 1
+                    continue
 
-            hashtags = extract_hashtags(text)
-            if hashtags:
-                app_name = hashtags[0]
-            else:
-                skipped += 1
-                continue
+                chat_id = message.chat_id or message.peer_id.channel_id
+                if hasattr(message.peer_id, 'channel_id'):
+                    chat_id = -1000000000000 - message.peer_id.channel_id
+                message_id = message.id
+                link = build_message_link(chat_id, message_id)
 
-            created_at = message.date.isoformat() if message.date else None
-            store_post(message_id, chat_id, app_name, text, link, created_at)
-            imported += 1
+                hashtags = extract_hashtags(text)
+                if hashtags:
+                    app_name = hashtags[0]
+                else:
+                    skipped += 1
+                    continue
 
-            if imported % 100 == 0:
-                logger.info("Auto-import: %d posts imported so far...", imported)
+                created_at = message.date.isoformat() if message.date else None
+                store_post(message_id, chat_id, app_name, text, link, created_at)
+                imported += 1
 
-        logger.info(
-            "✅ Auto-import complete! Imported: %d posts, Skipped: %d",
-            imported, skipped,
-        )
-    except Exception as e:
-        logger.error("Auto-import failed: %s", e)
-    finally:
-        if client:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+                if imported % 100 == 0:
+                    logger.info("Auto-import [%s]: %d posts imported so far...",
+                               channel_title, imported)
 
-    return imported
+            logger.info(
+                "✅ Auto-import [%s] complete! Imported: %d posts, Skipped: %d",
+                channel_title, imported, skipped,
+            )
+        except Exception as e:
+            logger.error("Auto-import failed for channel %s: %s", target, e)
+        finally:
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+        total_imported += imported
+        total_skipped += skipped
+
+    logger.info(
+        "✅ All channels imported! Total: %d posts, Skipped: %d",
+        total_imported, total_skipped,
+    )
+    return total_imported
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +620,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ai_status = "✅ Enabled" if _gemini_model else "❌ Disabled"
     text = (
         "👋 *Hello!*\n\n"
-        "I'm a *Channel APK Search Bot* with AI.\n\n"
+        "I'm a *MODAPPSKING Search Bot* with AI.\n\n"
         "📋 *How to use:*\n"
         "• Type an app name and I'll find it in the channel\n"
         "• You can use `#AppName` or just type the name\n"
@@ -590,7 +642,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     count = get_post_count()
     ai_status = "✅ Enabled" if _gemini_model else "❌ Disabled"
     await update.message.reply_text(
-        f"📊 *Bot Statistics*\n\n"
+        f"📊 *MODAPPSKING Search Bot Statistics*\n\n"
         f"📚 Total channel posts: *{count}*\n"
         f"🤖 AI: {ai_status}",
         parse_mode="Markdown",
@@ -782,7 +834,7 @@ def main() -> None:
 
     app.add_error_handler(error_handler)
 
-    logger.info("Bot is starting... Press Ctrl+C to stop.")
+    logger.info("MODAPPSKING Search Bot is starting... Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
