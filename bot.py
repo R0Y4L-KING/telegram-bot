@@ -5,13 +5,6 @@ Monitors a Telegram channel for posts containing #AppName tags.
 When a user in a group mentions an app name, the bot uses Gemini AI
 to extract the app name from the message, then searches the channel
 database and replies with a direct link to the LATEST post.
-
-Features:
-- Gemini AI smart app name extraction (spelling mistakes, Hinglish)
-- Auto-import channel history using Telethon user session
-- Self-ping keep-alive to reduce Render sleep
-- Fallback to heuristic method if Gemini fails
-- Latest post only (deduplication)
 """
 
 import os
@@ -56,7 +49,6 @@ API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-# Render sets this automatically — used for self-ping
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 logging.basicConfig(
@@ -89,10 +81,6 @@ def start_keep_alive(port: int) -> None:
 
 
 def self_ping():
-    """
-    Ping own URL every 5 minutes to prevent Render free tier from sleeping.
-    Uses RENDER_EXTERNAL_URL which Render sets automatically.
-    """
     if not RENDER_EXTERNAL_URL:
         logger.info("RENDER_EXTERNAL_URL not set — self-ping disabled. "
                     "Use UptimeRobot to keep bot awake.")
@@ -108,7 +96,7 @@ def self_ping():
             logger.debug("Self-ping OK")
         except Exception as e:
             logger.warning("Self-ping failed: %s", e)
-        time.sleep(300)  # 5 minutes
+        time.sleep(300)
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +130,7 @@ _gemini_model = None
 
 
 def init_gemini():
-    """Initialize Gemini AI model. Call once at startup."""
+    """Initialize Gemini AI model. Auto-detects available model."""
     global _gemini_model
     if not GEMINI_API_KEY:
         logger.info("GEMINI_API_KEY not set — AI features disabled, using fallback.")
@@ -151,16 +139,58 @@ def init_gemini():
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
 
-        # Try multiple model names in case one is not available
+        # Auto-detect available model — try multiple names
         model_names = [
+            "gemini-2.0-flash",
             "gemini-1.5-flash",
             "gemini-1.5-flash-latest",
-            "gemini-2.0-flash",
             "gemini-flash-latest",
+            "gemini-1.5-pro",
+            "gemini-1.5-pro-latest",
+            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
         ]
 
+        selected_model = None
+        for model_name in model_names:
+            try:
+                test_model = genai.GenerativeModel(model_name)
+                test_response = test_model.generate_content("Respond with OK")
+                if test_response and test_response.text:
+                    selected_model = model_name
+                    logger.info("✅ Gemini AI initialized with model: %s (response: %s)",
+                               model_name, test_response.text[:30].strip())
+                    break
+            except Exception as model_err:
+                logger.debug("Model %s not available: %s", model_name, str(model_err)[:80])
+                continue
+
+        if not selected_model:
+            # Last resort: list available models from API
+            try:
+                logger.info("Trying to list available models from Gemini API...")
+                for m in genai.list_models():
+                    if "generateContent" in [method.name for method in m.supported_generation_methods]:
+                        try:
+                            test_model = genai.GenerativeModel(m.name)
+                            test_response = test_model.generate_content("Respond with OK")
+                            if test_response and test_response.text:
+                                selected_model = m.name
+                                logger.info("✅ Gemini AI initialized with model: %s (from list)",
+                                           selected_model)
+                                break
+                        except Exception:
+                            continue
+            except Exception as list_err:
+                logger.error("Failed to list models: %s", list_err)
+
+        if not selected_model:
+            logger.error("❌ No working Gemini model found! AI disabled.")
+            return False
+
         _gemini_model = genai.GenerativeModel(
-            "gemini-1.5-flash",
+            selected_model,
             system_instruction=(
                 "You are an app name extractor bot. "
                 "Given a message from a Telegram group user, extract the app name "
@@ -180,16 +210,10 @@ def init_gemini():
             ),
         )
 
-        # Test the model with a simple query
-        try:
-            test_response = _gemini_model.generate_content("Test: respond with OK")
-            logger.info("✅ Gemini AI initialized and tested successfully. Response: %s",
-                       test_response.text[:50])
-            return True
-        except Exception as test_err:
-            logger.error("Gemini AI test call failed: %s", test_err)
-            _gemini_model = None
-            return False
+        # Final test with system instruction
+        test_response = _gemini_model.generate_content("Test: what is 2+2?")
+        logger.info("✅ Gemini AI fully initialized and tested. Model: %s", selected_model)
+        return True
 
     except Exception as e:
         logger.error("Failed to initialize Gemini AI: %s", e)
@@ -197,11 +221,7 @@ def init_gemini():
 
 
 async def gemini_extract_app_name(message_text: str) -> str:
-    """
-    Use Gemini AI to extract the app name from a user message.
-    Returns the app name, or empty string if not an app request.
-    Falls back to heuristic method if Gemini fails or times out.
-    """
+    """Use Gemini AI to extract app name from user message."""
     if not _gemini_model:
         return extract_app_name_from_sentence(message_text)
 
@@ -212,7 +232,6 @@ async def gemini_extract_app_name(message_text: str) -> str:
             )
             return response.text.strip()
 
-        # 15 second timeout for Gemini call
         result = await asyncio.wait_for(
             asyncio.to_thread(call_gemini),
             timeout=15.0,
@@ -234,10 +253,7 @@ async def gemini_extract_app_name(message_text: str) -> str:
 
 
 async def gemini_fuzzy_search(app_name: str, db_results: list) -> list:
-    """
-    Use Gemini AI to pick the best match from database results
-    when exact match is not found.
-    """
+    """Use Gemini AI to pick best match from database results."""
     if not _gemini_model or not db_results:
         return db_results
 
@@ -641,7 +657,6 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_search_request(message_text):
         return
 
-    # Use Gemini AI to extract app name (falls back to heuristic if no AI)
     app_query = await gemini_extract_app_name(message_text)
 
     if not app_query or len(app_query) < 2:
@@ -656,7 +671,6 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     results = search_by_app_name(app_query, limit=5)
 
-    # If no exact match, use Gemini for fuzzy matching
     if not results and _gemini_model:
         logger.info("No exact match — using Gemini fuzzy search...")
         all_names = get_all_app_names()
@@ -741,13 +755,11 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     init_db()
 
-    # Start keep-alive HTTP server
     keep_alive_thread = threading.Thread(
         target=start_keep_alive, args=(PORT,), daemon=True
     )
     keep_alive_thread.start()
 
-    # Start self-ping thread (to reduce Render sleep)
     ping_thread = threading.Thread(target=self_ping, daemon=True)
     ping_thread.start()
 
