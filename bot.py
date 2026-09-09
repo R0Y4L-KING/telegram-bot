@@ -5,16 +5,6 @@ A Telegram bot that monitors multiple channels for posts containing
 #AppName tags. When a user in a group mentions an app name, the bot
 uses Gemini AI to extract the app name, searches all configured channels,
 and replies with a direct link to the LATEST post.
-
-When Gemini AI is enabled:
-- Bot is permissive — lets most messages through to Gemini
-- Gemini decides if it's an app search or normal chat
-- This handles complex sentences like "bhai please yaar ek app ki need
-  hai wo dedo ke bhot din se aapko bol rha hu aapne nhi suna mujhe remini dedo"
-
-When Gemini AI is NOT enabled:
-- Bot uses strict heuristic filtering
-- Only responds to #hashtags, single words, and messages with app keywords
 """
 
 import os
@@ -108,7 +98,6 @@ def self_ping():
 # ---------------------------------------------------------------------------
 HASHTAG_PATTERN = re.compile(r"#([a-zA-Z0-9][a-zA-Z0-9 _]{1,40})", re.IGNORECASE)
 
-# Very short common messages to skip entirely (don't even send to Gemini)
 QUICK_SKIP = frozenset({
     "k", "kk", "ok", "okay", "okk", "hmm", "hmmm", "oh", "ah", "uff",
     "lol", "haha", "hehe", "nice", "cool", "good", "bad", "wow",
@@ -116,12 +105,11 @@ QUICK_SKIP = frozenset({
     "thank", "sorry", "pls", "please", "bhai", "bro", "dude", "mate",
     "sir", "madam", "boss", "master", "hi", "hello", "hey", "hlo",
     "hii", "helo", "namaste", "namaskar", "salaam", "adaab",
-    "fine", "great", "great", "bot", "admin",
+    "fine", "great", "bot", "admin",
     "haan", "nahi", "nhi", "theek", "thik", "accha", "acha",
     "kya", "kab", "kahan", "kyun", "kyu",
 })
 
-# Noise words for heuristic fallback
 NOISE_WORDS = frozenset({
     "bhai", "bro", "dude", "mate", "yo", "pls", "please", "kya", "hai",
     "hain", "nahi", "nhi", "haan", "ka", "ki", "ke", "ko", "me", "mein", "se",
@@ -140,8 +128,7 @@ NOISE_WORDS = frozenset({
     "bhejo", "send", "link", "download", "latest", "new", "old", "version",
     "chahiye", "chahiya", "dila", "dilado", "dedo", "mangta", "manga",
     "are", "bahut", "main", "tum", "hum", "ham", "tera", "teri",
-    "tumhara", "tumhari", "aap", "aapka", "aapki", "need", "was se",
-    "wasse", "wala", "wali", "yaar", "bhaiya", "dost",
+    "tumhara", "tumhari", "aap", "aapka", "aapki", "need", "yaar",
     "the", "a", "an", "is", "am", "are", "was", "were", "be", "been",
     "and", "or", "but", "if", "so", "for", "of", "to", "in", "on", "at",
     "by", "with", "from", "this", "that", "it", "as", "not", "no", "yes",
@@ -314,7 +301,20 @@ def build_message_link(chat_id: int, message_id: int) -> str:
 _gemini_model = None
 
 
+def _test_model(genai, model_name):
+    """Test if a model works by making a simple API call."""
+    try:
+        test_model = genai.GenerativeModel(model_name)
+        test_response = test_model.generate_content("Respond with OK")
+        if test_response and test_response.text:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def init_gemini():
+    """Initialize Gemini AI model. Auto-detects available model."""
     global _gemini_model
     if not GEMINI_API_KEY:
         logger.info("GEMINI_API_KEY not set — AI features disabled, using fallback.")
@@ -323,37 +323,47 @@ def init_gemini():
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
 
+        # Step 1: Try common model names
         model_names = [
-            "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-latest",
-            "gemini-flash-latest", "gemini-1.5-pro", "gemini-2.0-flash-lite",
-            "gemini-2.5-flash", "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-latest",
+            "gemini-flash-latest",
+            "gemini-1.5-pro",
+            "gemini-1.5-pro-latest",
+            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
         ]
 
         selected_model = None
         for model_name in model_names:
-            try:
-                test_model = genai.GenerativeModel(model_name)
-                test_response = test_model.generate_content("Respond with OK")
-                if test_response and test_response.text:
-                    selected_model = model_name
-                    logger.info("✅ Gemini AI initialized with model: %s", model_name)
-                    break
-            except Exception:
-                continue
+            if _test_model(genai, model_name):
+                selected_model = model_name
+                logger.info("✅ Gemini AI initialized with model: %s", model_name)
+                break
 
+        # Step 2: If none worked, list all available models from API
         if not selected_model:
             try:
+                logger.info("Trying to list available models from Gemini API...")
                 for m in genai.list_models():
-                    if "generateContent" in [method.name for method in m.supported_generation_methods]:
-                        try:
-                            test_model = genai.GenerativeModel(m.name)
-                            test_response = test_model.generate_content("Respond with OK")
-                            if test_response and test_response.text:
-                                selected_model = m.name
-                                logger.info("✅ Gemini AI: %s (from list)", selected_model)
-                                break
-                        except Exception:
-                            continue
+                    # supported_generation_methods can be list of strings OR objects
+                    methods = m.supported_generation_methods
+                    method_names = []
+                    for method in methods:
+                        if isinstance(method, str):
+                            method_names.append(method)
+                        elif hasattr(method, 'name'):
+                            method_names.append(method.name)
+                        else:
+                            method_names.append(str(method))
+
+                    if "generateContent" in method_names:
+                        if _test_model(genai, m.name):
+                            selected_model = m.name
+                            logger.info("✅ Gemini AI initialized with model: %s (from list)", selected_model)
+                            break
             except Exception as list_err:
                 logger.error("Failed to list models: %s", list_err)
 
@@ -402,10 +412,6 @@ def init_gemini():
 
 
 async def gemini_extract_app_name(message_text: str) -> str:
-    """
-    Use Gemini AI to extract app name.
-    If Gemini says NONE, return empty string — do NOT fall back to heuristic.
-    """
     if not _gemini_model:
         return extract_app_name_from_sentence(message_text)
 
@@ -478,7 +484,6 @@ def extract_text_from_message(message) -> str:
 
 
 def extract_app_name_from_sentence(text: str) -> str:
-    """Heuristic fallback — only used when Gemini is NOT available."""
     text = text.strip()
     hashtags = extract_hashtags(text)
     if hashtags:
@@ -490,38 +495,20 @@ def extract_app_name_from_sentence(text: str) -> str:
 
 
 def should_process_message(text: str, gemini_available: bool) -> bool:
-    """
-    Decide whether to process a group message.
-
-    When Gemini IS available (AI enabled):
-    - Skip very short messages (< 2 chars)
-    - Skip pure noise/greetings (single common word like "ok", "hi")
-    - Pass EVERYTHING else to Gemini — Gemini decides if it's an app search
-    - This allows complex sentences like "bhai please yaar... remini dedo"
-
-    When Gemini is NOT available (AI disabled):
-    - Use strict heuristic filtering
-    - Only respond to #hashtags, single words, and messages with app keywords
-    """
     text = text.strip()
     if not text or len(text) < 2:
         return False
 
-    # #hashtag → always process
     if HASHTAG_PATTERN.search(text):
         return True
 
-    # Check for very short single-word common messages
     if len(text.split()) == 1:
         word = text.strip().lower().strip(".,!?;:'\"")
         if word in QUICK_SKIP or len(word) < 3:
             return False
-        # Single word ≥3 chars → likely app name
         return True
 
     if gemini_available:
-        # Gemini is available — be permissive
-        # Check if message is just common noise (2 words, all noise)
         words = text.split()
         if len(words) <= 2:
             all_noise = all(w.lower().strip(".,!?;:'\"") in QUICK_SKIP or
@@ -529,10 +516,8 @@ def should_process_message(text: str, gemini_available: bool) -> bool:
                            for w in words)
             if all_noise:
                 return False
-        # Pass everything else to Gemini
         return True
     else:
-        # Gemini NOT available — strict heuristic
         text_lower = text.lower()
         app_keywords = {"apk", "app", "mod", "update", "link", "download",
                         "latest", "version", "chahiye", "chahiya", "dila",
@@ -548,8 +533,6 @@ def should_process_message(text: str, gemini_available: bool) -> bool:
                         if w.lower().strip(".,!?;:'\"") not in NOISE_WORDS
                         and len(w.strip(".,!?;:'\"")) >= 3]
             return bool(non_noise)
-
-        # 3+ words without app keywords → skip
         return False
 
 
@@ -680,8 +663,7 @@ async def addchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not context.args:
         await update.message.reply_text(
             "📋 *Add Channel*\n\nUsage: `/addchannel <channel_id>`\n\n"
-            "Example: `/addchannel -1001234567890`",
-            parse_mode="Markdown")
+            "Example: `/addchannel -1001234567890`", parse_mode="Markdown")
         return
     channel_id = context.args[0].strip()
     channels = get_channels()
@@ -753,25 +735,20 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     message_text = update.message.text
-
-    # Step 1: Quick filter — skip obvious non-search messages
     gemini_on = _gemini_model is not None
+
     if not should_process_message(message_text, gemini_on):
         return
 
-    # Step 2: Gemini extracts app name (or heuristic if Gemini not available)
     app_query = await gemini_extract_app_name(message_text)
 
     if not app_query or len(app_query) < 2:
-        # Gemini said NONE or empty — NOT an app search
         return
 
     logger.info("Searching: '%s' (from: '%s')", app_query, message_text)
 
-    # Step 3: Search database
     results = search_by_app_name(app_query, limit=5)
 
-    # Step 4: Gemini fuzzy search if no exact match
     if not results and _gemini_model:
         logger.info("No exact match — Gemini fuzzy search...")
         all_names = get_all_app_names()
