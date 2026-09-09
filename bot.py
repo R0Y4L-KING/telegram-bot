@@ -6,12 +6,12 @@ A Telegram bot that monitors multiple channels for posts containing
 uses Gemini AI to extract the app name, searches all configured channels,
 and replies with a direct link to the LATEST post.
 
-Features:
-- Multiple channel support (comma-separated CHANNEL_IDS)
-- Gemini AI smart app name extraction (spelling mistakes, Hinglish)
-- Auto-import channel history using Telethon user session
-- Self-ping keep-alive to reduce Render sleep
-- Latest post only (deduplication across channels)
+Channel management is done via Telegram commands:
+- /addchannel <id>    — Add a channel to monitor
+- /listchannels       — List all configured channels
+- /removechannel <id> — Remove a channel
+
+The first channel can also be set via CHANNEL_ID env var.
 """
 
 import os
@@ -46,14 +46,9 @@ if not BOT_TOKEN:
         "Get a token from @BotFather on Telegram."
     )
 
-# Channel configuration — supports MULTIPLE channels
-# PUBLIC channels: comma-separated usernames (without @)
-# Example: my_channel1,my_channel2
+# Initial channel — optional, can also be added via /addchannel command
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
-
-# PRIVATE channels: comma-separated channel IDs
-# Example: -1001234567890,-1009876543210
-CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+CHANNEL_ID_ENV = os.getenv("CHANNEL_ID", "")
 
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 PORT = int(os.getenv("PORT", "10000"))
@@ -65,6 +60,10 @@ SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
+# Bot owner — only this user can add/remove channels
+# Set to your Telegram user ID (get from @userinfobot)
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
     level=logging.INFO,
@@ -72,7 +71,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Keep-alive: HTTP server + self-ping
+# Keep-alive
 # ---------------------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -96,18 +95,14 @@ def start_keep_alive(port: int) -> None:
 
 def self_ping():
     if not RENDER_EXTERNAL_URL:
-        logger.info("RENDER_EXTERNAL_URL not set — self-ping disabled. "
-                    "Use UptimeRobot to keep bot awake.")
+        logger.info("RENDER_EXTERNAL_URL not set — self-ping disabled.")
         return
-
     ping_url = RENDER_EXTERNAL_URL.rstrip("/") + "/"
     logger.info("Self-ping enabled: will ping %s every 5 minutes", ping_url)
-
     import time
     while True:
         try:
             urllib.request.urlopen(ping_url, timeout=10)
-            logger.debug("Self-ping OK")
         except Exception as e:
             logger.warning("Self-ping failed: %s", e)
         time.sleep(300)
@@ -138,210 +133,24 @@ NOISE_WORDS = frozenset({
 
 
 # ---------------------------------------------------------------------------
-# Channel management — supports MULTIPLE channels
-# ---------------------------------------------------------------------------
-def get_channel_targets():
-    """
-    Parse CHANNEL_ID and CHANNEL_USERNAME env vars.
-    Returns a list of channel targets (ints for private, strings for public).
-    """
-    targets = []
-
-    # Parse comma-separated channel IDs (private channels)
-    if CHANNEL_ID:
-        for cid in CHANNEL_ID.split(","):
-            cid = cid.strip()
-            if cid:
-                try:
-                    targets.append(int(cid))
-                except ValueError:
-                    logger.warning("Invalid CHANNEL_ID entry: %s", cid)
-
-    # Parse comma-separated usernames (public channels)
-    if CHANNEL_USERNAME:
-        for uname in CHANNEL_USERNAME.split(","):
-            uname = uname.strip()
-            if uname:
-                targets.append(uname)
-
-    return targets
-
-
-# ---------------------------------------------------------------------------
-# Gemini AI — Smart app name extraction
-# ---------------------------------------------------------------------------
-_gemini_model = None
-
-
-def init_gemini():
-    """Initialize Gemini AI model. Auto-detects available model."""
-    global _gemini_model
-    if not GEMINI_API_KEY:
-        logger.info("GEMINI_API_KEY not set — AI features disabled, using fallback.")
-        return False
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-
-        model_names = [
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-1.5-flash-latest",
-            "gemini-flash-latest",
-            "gemini-1.5-pro",
-            "gemini-1.5-pro-latest",
-            "gemini-2.0-flash-lite",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-        ]
-
-        selected_model = None
-        for model_name in model_names:
-            try:
-                test_model = genai.GenerativeModel(model_name)
-                test_response = test_model.generate_content("Respond with OK")
-                if test_response and test_response.text:
-                    selected_model = model_name
-                    logger.info("✅ Gemini AI initialized with model: %s (response: %s)",
-                               model_name, test_response.text[:30].strip())
-                    break
-            except Exception as model_err:
-                logger.debug("Model %s not available: %s", model_name, str(model_err)[:80])
-                continue
-
-        if not selected_model:
-            try:
-                logger.info("Trying to list available models from Gemini API...")
-                for m in genai.list_models():
-                    if "generateContent" in [method.name for method in m.supported_generation_methods]:
-                        try:
-                            test_model = genai.GenerativeModel(m.name)
-                            test_response = test_model.generate_content("Respond with OK")
-                            if test_response and test_response.text:
-                                selected_model = m.name
-                                logger.info("✅ Gemini AI initialized with model: %s (from list)",
-                                           selected_model)
-                                break
-                        except Exception:
-                            continue
-            except Exception as list_err:
-                logger.error("Failed to list models: %s", list_err)
-
-        if not selected_model:
-            logger.error("❌ No working Gemini model found! AI disabled.")
-            return False
-
-        _gemini_model = genai.GenerativeModel(
-            selected_model,
-            system_instruction=(
-                "You are an app name extractor bot. "
-                "Given a message from a Telegram group user, extract the app name "
-                "they are looking for. "
-                "Respond with ONLY the app name, nothing else. "
-                "If the message is not about an app, respond with 'NONE'. "
-                "Handle spelling mistakes, Hinglish, and messy sentences. "
-                "Examples:\n"
-                "Input: 'bhai remini ka apk update krdo pls' → Output: Remini\n"
-                "Input: 'I stream flare apk chahiye' → Output: I Stream Flare\n"
-                "Input: 'capcut mod dedo bhai' → Output: CapCut\n"
-                "Input: 'hello kaise ho' → Output: NONE\n"
-                "Input: 'reemni' → Output: Remini\n"
-                "Input: 'cupcut' → Output: CapCut\n"
-                "Input: 'tirculler' → Output: Truecaller\n"
-                "Input: '#QuickTv' → Output: QuickTv\n"
-            ),
-        )
-
-        test_response = _gemini_model.generate_content("Test: what is 2+2?")
-        logger.info("✅ Gemini AI fully initialized and tested. Model: %s", selected_model)
-        return True
-
-    except Exception as e:
-        logger.error("Failed to initialize Gemini AI: %s", e)
-        return False
-
-
-async def gemini_extract_app_name(message_text: str) -> str:
-    """Use Gemini AI to extract app name from user message."""
-    if not _gemini_model:
-        return extract_app_name_from_sentence(message_text)
-
-    try:
-        def call_gemini():
-            response = _gemini_model.generate_content(
-                f"Extract the app name from this message:\n{message_text}"
-            )
-            return response.text.strip()
-
-        result = await asyncio.wait_for(
-            asyncio.to_thread(call_gemini),
-            timeout=15.0,
-        )
-
-        result = result.strip().strip('"').strip("'").strip()
-
-        if result.upper() == "NONE" or not result or len(result) < 2:
-            return ""
-
-        logger.info("Gemini extracted app name: '%s' from '%s'", result, message_text)
-        return result
-    except asyncio.TimeoutError:
-        logger.warning("Gemini AI timed out (15s), falling back to heuristic.")
-        return extract_app_name_from_sentence(message_text)
-    except Exception as e:
-        logger.warning("Gemini AI failed (%s), falling back to heuristic.", e)
-        return extract_app_name_from_sentence(message_text)
-
-
-async def gemini_fuzzy_search(app_name: str, db_results: list) -> list:
-    """Use Gemini AI to pick best match from database results."""
-    if not _gemini_model or not db_results:
-        return db_results
-
-    try:
-        app_names_in_db = [r["app_name"] for r in db_results if r["app_name"]]
-        if not app_names_in_db:
-            return db_results
-
-        def call_gemini():
-            prompt = (
-                f"The user searched for: '{app_name}'\n"
-                f"Available apps in database:\n"
-            )
-            for i, name in enumerate(app_names_in_db, 1):
-                prompt += f"{i}. {name}\n"
-            prompt += (
-                f"\nWhich of these apps is the user most likely looking for? "
-                f"Respond with ONLY the app name, or 'NONE' if no good match."
-            )
-            response = _gemini_model.generate_content(prompt)
-            return response.text.strip()
-
-        result = await asyncio.wait_for(
-            asyncio.to_thread(call_gemini),
-            timeout=15.0,
-        )
-        result = result.strip().strip('"').strip("'").strip()
-
-        if result.upper() == "NONE":
-            return []
-
-        for post in db_results:
-            if post["app_name"] and post["app_name"].lower() == result.lower():
-                logger.info("Gemini fuzzy match: '%s' → '%s'", app_name, result)
-                return [post]
-
-        return db_results
-    except Exception as e:
-        logger.warning("Gemini fuzzy search failed (%s), returning raw results.", e)
-        return db_results
-
-
-# ---------------------------------------------------------------------------
-# Database
+# Database — channels table + posts table
 # ---------------------------------------------------------------------------
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
+
+    # Channels table — stores all configured channels
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channels (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id      TEXT NOT NULL UNIQUE,
+            channel_title   TEXT,
+            added_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    # Posts table
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS channel_posts (
@@ -357,6 +166,73 @@ def init_db() -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_app_name ON channel_posts(app_name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_full_text ON channel_posts(full_text)")
+    conn.commit()
+
+    # Seed channels from environment variables (first run only)
+    if CHANNEL_ID_ENV:
+        for cid in CHANNEL_ID_ENV.split(","):
+            cid = cid.strip()
+            if cid:
+                conn.execute(
+                    "INSERT OR IGNORE INTO channels (channel_id) VALUES (?)",
+                    (cid,),
+                )
+    if CHANNEL_USERNAME:
+        for uname in CHANNEL_USERNAME.split(","):
+            uname = uname.strip()
+            if uname:
+                conn.execute(
+                    "INSERT OR IGNORE INTO channels (channel_id) VALUES (?)",
+                    (uname,),
+                )
+    conn.commit()
+    conn.close()
+
+
+def get_channels() -> list:
+    """Return list of all configured channel IDs."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute("SELECT channel_id, channel_title FROM channels ORDER BY added_at")
+    channels = [{"id": r[0], "title": r[1]} for r in cursor.fetchall()]
+    conn.close()
+    return channels
+
+
+def add_channel(channel_id: str) -> bool:
+    """Add a channel. Returns True if new, False if already exists."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO channels (channel_id) VALUES (?)",
+            (channel_id,),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+
+def remove_channel(channel_id: str) -> bool:
+    """Remove a channel. Returns True if removed, False if not found."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        "DELETE FROM channels WHERE channel_id = ?",
+        (channel_id,),
+    )
+    conn.commit()
+    removed = cursor.rowcount > 0
+    conn.close()
+    return removed
+
+
+def update_channel_title(channel_id: str, title: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE channels SET channel_title = ? WHERE channel_id = ?",
+        (title, channel_id),
+    )
     conn.commit()
     conn.close()
 
@@ -444,12 +320,12 @@ def get_post_count() -> int:
 
 
 def build_message_link(chat_id: int, message_id: int) -> str:
-    # Check if this chat_id matches a configured public channel
-    if CHANNEL_USERNAME:
-        for uname in CHANNEL_USERNAME.split(","):
-            uname = uname.strip()
-            if uname:
-                return f"https://t.me/{uname}/{message_id}"
+    # Check if any public channel username is configured
+    channels = get_channels()
+    for ch in channels:
+        ch_id = ch["id"]
+        if not ch_id.startswith("-"):  # Public channel (username)
+            return f"https://t.me/{ch_id}/{message_id}"
 
     # Private channel link format
     if chat_id < 0:
@@ -459,16 +335,157 @@ def build_message_link(chat_id: int, message_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Gemini AI
+# ---------------------------------------------------------------------------
+_gemini_model = None
+
+
+def init_gemini():
+    global _gemini_model
+    if not GEMINI_API_KEY:
+        logger.info("GEMINI_API_KEY not set — AI features disabled, using fallback.")
+        return False
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+
+        model_names = [
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-latest",
+            "gemini-flash-latest",
+            "gemini-1.5-pro",
+            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ]
+
+        selected_model = None
+        for model_name in model_names:
+            try:
+                test_model = genai.GenerativeModel(model_name)
+                test_response = test_model.generate_content("Respond with OK")
+                if test_response and test_response.text:
+                    selected_model = model_name
+                    logger.info("✅ Gemini AI initialized with model: %s", model_name)
+                    break
+            except Exception:
+                continue
+
+        if not selected_model:
+            try:
+                for m in genai.list_models():
+                    if "generateContent" in [method.name for method in m.supported_generation_methods]:
+                        try:
+                            test_model = genai.GenerativeModel(m.name)
+                            test_response = test_model.generate_content("Respond with OK")
+                            if test_response and test_response.text:
+                                selected_model = m.name
+                                logger.info("✅ Gemini AI initialized with model: %s (from list)", selected_model)
+                                break
+                        except Exception:
+                            continue
+            except Exception as list_err:
+                logger.error("Failed to list models: %s", list_err)
+
+        if not selected_model:
+            logger.error("❌ No working Gemini model found! AI disabled.")
+            return False
+
+        _gemini_model = genai.GenerativeModel(
+            selected_model,
+            system_instruction=(
+                "You are an app name extractor bot. "
+                "Given a message from a Telegram group user, extract the app name "
+                "they are looking for. "
+                "Respond with ONLY the app name, nothing else. "
+                "If the message is not about an app, respond with 'NONE'. "
+                "Handle spelling mistakes, Hinglish, and messy sentences. "
+                "Examples:\n"
+                "Input: 'bhai remini ka apk update krdo pls' → Output: Remini\n"
+                "Input: 'I stream flare apk chahiye' → Output: I Stream Flare\n"
+                "Input: 'capcut mod dedo bhai' → Output: CapCut\n"
+                "Input: 'hello kaise ho' → Output: NONE\n"
+                "Input: 'reemni' → Output: Remini\n"
+                "Input: 'cupcut' → Output: CapCut\n"
+                "Input: 'tirculler' → Output: Truecaller\n"
+                "Input: '#QuickTv' → Output: QuickTv\n"
+            ),
+        )
+
+        _gemini_model.generate_content("Test: what is 2+2?")
+        logger.info("✅ Gemini AI fully initialized. Model: %s", selected_model)
+        return True
+
+    except Exception as e:
+        logger.error("Failed to initialize Gemini AI: %s", e)
+        return False
+
+
+async def gemini_extract_app_name(message_text: str) -> str:
+    if not _gemini_model:
+        return extract_app_name_from_sentence(message_text)
+
+    try:
+        def call_gemini():
+            response = _gemini_model.generate_content(
+                f"Extract the app name from this message:\n{message_text}"
+            )
+            return response.text.strip()
+
+        result = await asyncio.wait_for(asyncio.to_thread(call_gemini), timeout=15.0)
+        result = result.strip().strip('"').strip("'").strip()
+
+        if result.upper() == "NONE" or not result or len(result) < 2:
+            return ""
+
+        logger.info("Gemini extracted: '%s' from '%s'", result, message_text)
+        return result
+    except asyncio.TimeoutError:
+        logger.warning("Gemini AI timed out, falling back.")
+        return extract_app_name_from_sentence(message_text)
+    except Exception as e:
+        logger.warning("Gemini AI failed (%s), falling back.", e)
+        return extract_app_name_from_sentence(message_text)
+
+
+async def gemini_fuzzy_search(app_name: str, db_results: list) -> list:
+    if not _gemini_model or not db_results:
+        return db_results
+
+    try:
+        app_names_in_db = [r["app_name"] for r in db_results if r["app_name"]]
+        if not app_names_in_db:
+            return db_results
+
+        def call_gemini():
+            prompt = f"The user searched for: '{app_name}'\nAvailable apps:\n"
+            for i, name in enumerate(app_names_in_db, 1):
+                prompt += f"{i}. {name}\n"
+            prompt += "\nWhich is the best match? Respond with ONLY the app name, or 'NONE'."
+            return _gemini_model.generate_content(prompt).text.strip()
+
+        result = await asyncio.wait_for(asyncio.to_thread(call_gemini), timeout=15.0)
+        result = result.strip().strip('"').strip("'").strip()
+
+        if result.upper() == "NONE":
+            return []
+
+        for post in db_results:
+            if post["app_name"] and post["app_name"].lower() == result.lower():
+                return [post]
+        return db_results
+    except Exception as e:
+        logger.warning("Gemini fuzzy search failed: %s", e)
+        return db_results
+
+
+# ---------------------------------------------------------------------------
 # Text extraction (fallback)
 # ---------------------------------------------------------------------------
 def extract_hashtags(text: str) -> list:
     matches = HASHTAG_PATTERN.findall(text)
-    cleaned = []
-    for m in matches:
-        name = m.strip()
-        if name and len(name) >= 2:
-            cleaned.append(name)
-    return cleaned
+    return [m.strip() for m in matches if m.strip() and len(m.strip()) >= 2]
 
 
 def extract_text_from_message(message) -> str:
@@ -487,9 +504,7 @@ def extract_app_name_from_sentence(text: str) -> str:
     cleaned = re.sub(r"[^\w\s]", " ", text)
     words = cleaned.split()
     app_words = [w for w in words if w.lower() not in NOISE_WORDS and len(w) >= 2]
-    if not app_words:
-        return ""
-    return " ".join(app_words)
+    return " ".join(app_words) if app_words else ""
 
 
 def is_search_request(text: str) -> bool:
@@ -518,105 +533,113 @@ def is_search_request(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Auto-import channel history (Telethon) — supports MULTIPLE channels
+# Auto-import channel history (Telethon) — imports ALL configured channels
 # ---------------------------------------------------------------------------
-async def auto_import_history_async():
+async def import_channel_history(channel_target):
+    """Import history from a single channel."""
     if not SESSION_STRING:
-        logger.warning(
-            "SESSION_STRING not set — skipping auto-import. "
-            "Run generate_session.py locally to get a session string."
-        )
-        return 0
+        logger.warning("SESSION_STRING not set — cannot import.")
+        return 0, 0
 
     if not API_ID or not API_HASH:
-        logger.warning("API_ID/API_HASH not set — skipping auto-import.")
-        return 0
-
-    targets = get_channel_targets()
-    if not targets:
-        logger.warning("No channels configured (CHANNEL_ID or CHANNEL_USERNAME not set).")
-        return 0
+        logger.warning("API_ID/API_HASH not set — cannot import.")
+        return 0, 0
 
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
     except ImportError:
-        logger.error("Telethon not installed! Run: pip install telethon")
-        return 0
+        logger.error("Telethon not installed!")
+        return 0, 0
+
+    imported = 0
+    skipped = 0
+
+    # Resolve target to int if numeric
+    try:
+        target_resolved = int(channel_target)
+    except ValueError:
+        target_resolved = channel_target
+
+    client = None
+    try:
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        await client.start()
+
+        entity = await client.get_entity(target_resolved)
+        channel_title = getattr(entity, 'title', str(channel_target))
+        update_channel_title(str(channel_target), channel_title)
+        logger.info("Importing from: %s", channel_title)
+
+        async for message in client.iter_messages(entity):
+            text = message.text or message.message or ""
+            if not text:
+                skipped += 1
+                continue
+
+            chat_id = message.chat_id or message.peer_id.channel_id
+            if hasattr(message.peer_id, 'channel_id'):
+                chat_id = -1000000000000 - message.peer_id.channel_id
+            message_id = message.id
+            link = build_message_link(chat_id, message_id)
+
+            hashtags = extract_hashtags(text)
+            if hashtags:
+                app_name = hashtags[0]
+            else:
+                skipped += 1
+                continue
+
+            created_at = message.date.isoformat() if message.date else None
+            store_post(message_id, chat_id, app_name, text, link, created_at)
+            imported += 1
+
+            if imported % 100 == 0:
+                logger.info("[%s] %d posts imported...", channel_title, imported)
+
+        logger.info("✅ [%s] Import complete: %d imported, %d skipped",
+                    channel_title, imported, skipped)
+    except Exception as e:
+        logger.error("Import failed for %s: %s", channel_target, e)
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+    return imported, skipped
+
+
+async def auto_import_all_channels():
+    """Import history from ALL configured channels."""
+    channels = get_channels()
+    if not channels:
+        logger.info("No channels configured — skipping import.")
+        return
 
     total_imported = 0
-    total_skipped = 0
-
-    for target in targets:
-        logger.info("Starting auto-import for channel: %s", target)
-        imported = 0
-        skipped = 0
-
-        client = None
-        try:
-            client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-            await client.start()
-            logger.info("Telethon user session started, reading channel history...")
-
-            entity = await client.get_entity(target)
-            channel_title = getattr(entity, 'title', str(target))
-            logger.info("Resolved channel entity: %s", channel_title)
-
-            async for message in client.iter_messages(entity):
-                text = message.text or message.message or ""
-                if not text:
-                    skipped += 1
-                    continue
-
-                chat_id = message.chat_id or message.peer_id.channel_id
-                if hasattr(message.peer_id, 'channel_id'):
-                    chat_id = -1000000000000 - message.peer_id.channel_id
-                message_id = message.id
-                link = build_message_link(chat_id, message_id)
-
-                hashtags = extract_hashtags(text)
-                if hashtags:
-                    app_name = hashtags[0]
-                else:
-                    skipped += 1
-                    continue
-
-                created_at = message.date.isoformat() if message.date else None
-                store_post(message_id, chat_id, app_name, text, link, created_at)
-                imported += 1
-
-                if imported % 100 == 0:
-                    logger.info("Auto-import [%s]: %d posts imported so far...",
-                               channel_title, imported)
-
-            logger.info(
-                "✅ Auto-import [%s] complete! Imported: %d posts, Skipped: %d",
-                channel_title, imported, skipped,
-            )
-        except Exception as e:
-            logger.error("Auto-import failed for channel %s: %s", target, e)
-        finally:
-            if client:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-
+    for ch in channels:
+        logger.info("Auto-import for channel: %s", ch["id"])
+        imported, _ = await import_channel_history(ch["id"])
         total_imported += imported
-        total_skipped += skipped
 
-    logger.info(
-        "✅ All channels imported! Total: %d posts, Skipped: %d",
-        total_imported, total_skipped,
-    )
-    return total_imported
+    logger.info("✅ All channels imported! Total: %d posts", total_imported)
 
 
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+def is_owner(update: Update) -> bool:
+    """Check if the user is the bot owner."""
+    if not OWNER_ID:
+        return True  # If OWNER_ID not set, allow everyone (for testing)
+    return update.effective_user.id == OWNER_ID
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     count = get_post_count()
+    channels = get_channels()
     ai_status = "✅ Enabled" if _gemini_model else "❌ Disabled"
     text = (
         "👋 *Hello!*\n\n"
@@ -632,38 +655,148 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "• `bhai capcut ka mod dila do`\n"
         "• `reemni` (spelling mistake — AI will fix!)\n\n"
         "📌 I always give the *latest* link for each app.\n"
-        f"🤖 AI: {ai_status}\n\n"
-        f"📚 Currently tracking *{count}* channel posts."
+        f"🤖 AI: {ai_status}\n"
+        f"📚 Currently tracking *{count}* channel posts.\n"
+        f"📺 Configured channels: *{len(channels)}*"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     count = get_post_count()
+    channels = get_channels()
     ai_status = "✅ Enabled" if _gemini_model else "❌ Disabled"
+    channel_list = "\n".join(
+        f"• {ch['title'] or ch['id']}" for ch in channels
+    ) or "None"
     await update.message.reply_text(
         f"📊 *MODAPPSKING Search Bot Statistics*\n\n"
         f"📚 Total channel posts: *{count}*\n"
-        f"🤖 AI: {ai_status}",
+        f"🤖 AI: {ai_status}\n"
+        f"📺 Channels ({len(channels)}):\n{channel_list}",
         parse_mode="Markdown",
     )
 
 
+async def addchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a channel to monitor. Usage: /addchannel -1001234567890"""
+    if not is_owner(update):
+        await update.message.reply_text("❌ Only the bot owner can add channels.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📋 *Add Channel*\n\n"
+            "Usage: `/addchannel <channel_id>`\n\n"
+            "Example:\n"
+            "• `/addchannel -1001234567890` (private channel)\n"
+            "• `/addchannel my_channel` (public channel, without @)\n\n"
+            "Get channel ID: forward a message from your channel to @userinfobot",
+            parse_mode="Markdown",
+        )
+        return
+
+    channel_id = context.args[0].strip()
+
+    # Check if already exists
+    channels = get_channels()
+    if any(ch["id"] == channel_id for ch in channels):
+        await update.message.reply_text(
+            f"⚠️ Channel `{channel_id}` is already configured.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Add to database
+    if add_channel(channel_id):
+        await update.message.reply_text(
+            f"✅ Channel `{channel_id}` added!\n"
+            f"⏳ Importing channel history... This may take a few minutes.\n"
+            f"Run /stats to check progress.",
+            parse_mode="Markdown",
+        )
+
+        # Auto-import this channel's history in background
+        def run_import():
+            asyncio.run(import_channel_history(channel_id))
+
+        thread = threading.Thread(target=run_import, daemon=True)
+        thread.start()
+    else:
+        await update.message.reply_text(
+            f"❌ Failed to add channel `{channel_id}`.",
+            parse_mode="Markdown",
+        )
+
+
+async def listchannels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all configured channels."""
+    channels = get_channels()
+    if not channels:
+        await update.message.reply_text(
+            "📺 No channels configured.\n"
+            "Use `/addchannel <channel_id>` to add one.",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = ["📺 *Configured Channels:*\n"]
+    for i, ch in enumerate(channels, 1):
+        title = ch["title"] or "Unknown"
+        lines.append(f"{i}. *{title}*\n   ID: `{ch['id']}`")
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown",
+    )
+
+
+async def removechannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a channel. Usage: /removechannel -1001234567890"""
+    if not is_owner(update):
+        await update.message.reply_text("❌ Only the bot owner can remove channels.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📋 *Remove Channel*\n\n"
+            "Usage: `/removechannel <channel_id>`\n\n"
+            "Use `/listchannels` to see configured channels.",
+            parse_mode="Markdown",
+        )
+        return
+
+    channel_id = context.args[0].strip()
+
+    if remove_channel(channel_id):
+        await update.message.reply_text(
+            f"✅ Channel `{channel_id}` removed.\n"
+            f"Note: Previously imported posts are still in the database.\n"
+            f"They will be removed on next full re-import.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Channel `{channel_id}` not found.\n"
+            f"Use `/listchannels` to see configured channels.",
+            parse_mode="Markdown",
+        )
+
+
 async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually trigger import for all channels."""
     if not SESSION_STRING:
         await update.message.reply_text(
             "❌ Import not available.\n"
-            "Session string not configured. "
-            "Run generate_session.py locally first."
+            "Session string not configured."
         )
         return
 
     await update.message.reply_text(
-        "⏳ Importing channel history... This may take a few minutes."
+        "⏳ Importing all channel history... This may take a few minutes."
     )
 
     def run_import():
-        asyncio.run(auto_import_history_async())
+        asyncio.run(auto_import_all_channels())
 
     thread = threading.Thread(target=run_import, daemon=True)
     thread.start()
@@ -671,14 +804,12 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     count = get_post_count()
     await update.message.reply_text(
         f"✅ Import started! Current database has *{count}* posts.\n"
-        f"Run /stats after a minute to check updated count.",
+        f"Run /stats after a minute to check.",
         parse_mode="Markdown",
     )
 
 
-async def channel_post_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.channel_post:
         return
     post = update.channel_post
@@ -689,15 +820,9 @@ async def channel_post_handler(
     message_id = post.message_id
     link = build_message_link(chat_id, message_id)
     hashtags = extract_hashtags(text)
-    if hashtags:
-        app_name = hashtags[0]
-    else:
-        app_name = text[:50]
+    app_name = hashtags[0] if hashtags else text[:50]
     store_post(message_id, chat_id, app_name, text, link)
-    logger.info(
-        "Stored channel post %s — app: %s (text: %.50s...)",
-        message_id, app_name, text,
-    )
+    logger.info("Stored channel post %s — app: %s", message_id, app_name)
 
 
 async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -705,26 +830,19 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     message_text = update.message.text
-
     if not is_search_request(message_text):
         return
 
     app_query = await gemini_extract_app_name(message_text)
-
     if not app_query or len(app_query) < 2:
         return
 
-    logger.info(
-        "Searching for: '%s' (extracted from: '%s') — user: %s, chat: %s",
-        app_query, message_text,
-        update.effective_user.username or update.effective_user.id,
-        update.effective_chat.id,
-    )
+    logger.info("Searching: '%s' (from: '%s')", app_query, message_text)
 
     results = search_by_app_name(app_query, limit=5)
 
     if not results and _gemini_model:
-        logger.info("No exact match — using Gemini fuzzy search...")
+        logger.info("No exact match — Gemini fuzzy search...")
         all_names = get_all_app_names()
         if all_names:
             broad_results = []
@@ -742,15 +860,13 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                             {"app_name": r[0], "text": r[1], "link": r[2], "message_id": r[3]}
                         )
                     conn.close()
-
             if broad_results:
                 results = await gemini_fuzzy_search(app_query, broad_results)
 
     if not results:
         if HASHTAG_PATTERN.search(message_text):
             await update.message.reply_text(
-                f"❌ No match found for *{escape(app_query)}*.\n"
-                f"This app might not be in the channel yet.",
+                f"❌ No match found for *{escape(app_query)}*.",
                 parse_mode="Markdown",
             )
         return
@@ -790,13 +906,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_init(application: Application) -> None:
-    """Run after bot init — initialize AI and auto-import if needed."""
     init_gemini()
-
     count = get_post_count()
     if count == 0:
-        logger.info("Database is empty — running auto-import...")
-        await auto_import_history_async()
+        logger.info("Database is empty — running auto-import for all channels...")
+        await auto_import_all_channels()
     else:
         logger.info("Database has %d posts — skipping auto-import.", count)
 
@@ -807,9 +921,7 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     init_db()
 
-    keep_alive_thread = threading.Thread(
-        target=start_keep_alive, args=(PORT,), daemon=True
-    )
+    keep_alive_thread = threading.Thread(target=start_keep_alive, args=(PORT,), daemon=True)
     keep_alive_thread.start()
 
     ping_thread = threading.Thread(target=self_ping, daemon=True)
@@ -817,14 +929,19 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("import", import_command))
+    app.add_handler(CommandHandler("addchannel", addchannel_command))
+    app.add_handler(CommandHandler("listchannels", listchannels_command))
+    app.add_handler(CommandHandler("removechannel", removechannel_command))
 
-    app.add_handler(
-        MessageHandler(filters.UpdateType.CHANNEL_POSTS, channel_post_handler)
-    )
+    # Channel post handler
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, channel_post_handler))
+
+    # Group message handler
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
