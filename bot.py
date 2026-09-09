@@ -46,7 +46,6 @@ if not BOT_TOKEN:
         "Get a token from @BotFather on Telegram."
     )
 
-# Initial channel — optional, can also be added via /addchannel command
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
 CHANNEL_ID_ENV = os.getenv("CHANNEL_ID", "")
 
@@ -60,8 +59,6 @@ SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
-# Bot owner — only this user can add/remove channels
-# Set to your Telegram user ID (get from @userinfobot)
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 logging.basicConfig(
@@ -109,36 +106,61 @@ def self_ping():
 
 
 # ---------------------------------------------------------------------------
-# Patterns
+# Patterns & noise words
 # ---------------------------------------------------------------------------
 HASHTAG_PATTERN = re.compile(r"#([a-zA-Z0-9][a-zA-Z0-9 _]{1,40})", re.IGNORECASE)
 
+# Extensive noise words — Hindi + English common chat words
 NOISE_WORDS = frozenset({
+    # Hindi common words
     "bhai", "bro", "dude", "mate", "yo", "pls", "please", "kya", "hai",
-    "hain", "nahi", "haan", "ka", "ki", "ke", "ko", "me", "mein", "se",
-    "par", "aur", "ya", "to", "bhi", "hi", "tha", "thi", "the", "ho",
-    "de", "do", "dila", "dilado", "chahiye", "chahiya",
-    "mujhe", "muje", "mujhko", "hamko", "humko", "merako",
-    "apk", "app", "mod", "update", "krdo", "kar", "karo", "dena", "de do",
+    "hain", "nahi", "nhi", "haan", "ka", "ki", "ke", "ko", "me", "mein", "se",
+    "par", "aur", "ya", "to", "bhi", "hi", "tha", "thi", "the", "ho", "hu",
+    "de", "do", "dila", "dilado", "chahiye", "chahiya", "ab", "phle", "pahle",
+    "dia", "diya", "diya", "payega", "paygi", "hogya", "hogi", "hoga", "gaya",
+    "mujhe", "muje", "mujhko", "hamko", "humko", "merako", "mera", "meri",
+    "kar", "karo", "krdo", "krdi", "kiya", "karna", "karna", "rah", "raha",
+    "rahi", "rhe", "reh", "liya", "lena", "lenge", "dene", "denge", "dene",
+    "wala", "wali", "wale", "kaun", "konsa", "konsi", "kahan", "kab", "kyun",
+    "kyu", "aise", "aisa", "aisi", "waise", "waisa", "waisi", "itna", "utna",
+    "kitna", "bahut", "thoda", "zyada", "kam", "jada", "sab", "kuch", "kuch",
+    "jo", "wo", "ye", "vo", "uska", "uski", "uskha", "unka", "unki",
+    "eska", "eski", "tesra", "pehla", "akhiri", "last", "first", "second",
+    # App request words (used in sentences but not app names)
+    "apk", "app", "mod", "update", "krdo", "karo", "dena", "de", "do",
     "bhejo", "send", "link", "download", "latest", "new", "old", "version",
+    "chahiye", "chahiya", "dila", "dilado", "dedo", "deda", "manga", "mango",
+    "mangta", "mangti", "mangya", "deya", "kha", "kuch", "kuch",
+    # English stopwords
     "the", "a", "an", "is", "am", "are", "was", "were", "be", "been",
     "and", "or", "but", "if", "so", "for", "of", "to", "in", "on", "at",
-    "by", "with", "from", "this", "that", "it", "as",
+    "by", "with", "from", "this", "that", "it", "as", "not", "no", "yes",
+    "have", "has", "had", "will", "would", "could", "should", "can",
+    "just", "only", "also", "there", "here", "now", "then", "about",
+    "into", "than", "them", "they", "these", "those", "some", "any", "all",
+    "more", "most", "other", "such", "own", "same", "few", "further",
+    "do", "does", "did", "doing", "get", "got", "getting", "going", "go",
+    "make", "made", "take", "took", "came", "come", "give", "gave", "find",
+    "found", "look", "looking", "try", "trying", "want", "need", "wish",
+    # Greetings & filler
     "hi", "hello", "hey", "hlo", "hii", "helo", "namaste", "namaskar",
-    "ok", "okay", "thanks", "thank", "thx", "sorry", "bye",
-    "bot", "admin", "group", "channel", "k", "kk", "hmm", "hmmm",
-    "wow", "nice", "cool", "good", "bad", "fine", "great",
-    "sir", "madam", "master", "boss",
+    "ok", "okay", "thanks", "thank", "thx", "sorry", "bye", "gn", "gm",
+    "bot", "admin", "group", "channel", "k", "kk", "hmm", "hmmm", "oh",
+    "wow", "nice", "cool", "good", "bad", "fine", "great", "sir", "madam",
+    "master", "boss", "bhandara", "krna", "lagta", "agla", "kab",
+    # Conversation phrases (not app names)
+    "are", "bhai", "bahut", "phle", "dia", "tha", "ab", "nhi", "ho", "payega",
+    "me", "hu", "main", "mera", "meri", "apun", "tum", "tu", "tera", "teri",
+    "hum", "ham", "tumhara", "tumhari", "aap", "aapka", "aapki",
 })
 
 
 # ---------------------------------------------------------------------------
-# Database — channels table + posts table
+# Database
 # ---------------------------------------------------------------------------
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
 
-    # Channels table — stores all configured channels
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS channels (
@@ -150,7 +172,6 @@ def init_db() -> None:
         """
     )
 
-    # Posts table
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS channel_posts (
@@ -168,7 +189,6 @@ def init_db() -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_full_text ON channel_posts(full_text)")
     conn.commit()
 
-    # Seed channels from environment variables (first run only)
     if CHANNEL_ID_ENV:
         for cid in CHANNEL_ID_ENV.split(","):
             cid = cid.strip()
@@ -190,7 +210,6 @@ def init_db() -> None:
 
 
 def get_channels() -> list:
-    """Return list of all configured channel IDs."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute("SELECT channel_id, channel_title FROM channels ORDER BY added_at")
     channels = [{"id": r[0], "title": r[1]} for r in cursor.fetchall()]
@@ -199,13 +218,9 @@ def get_channels() -> list:
 
 
 def add_channel(channel_id: str) -> bool:
-    """Add a channel. Returns True if new, False if already exists."""
     conn = sqlite3.connect(DB_PATH)
     try:
-        conn.execute(
-            "INSERT INTO channels (channel_id) VALUES (?)",
-            (channel_id,),
-        )
+        conn.execute("INSERT INTO channels (channel_id) VALUES (?)", (channel_id,))
         conn.commit()
         conn.close()
         return True
@@ -215,12 +230,8 @@ def add_channel(channel_id: str) -> bool:
 
 
 def remove_channel(channel_id: str) -> bool:
-    """Remove a channel. Returns True if removed, False if not found."""
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.execute(
-        "DELETE FROM channels WHERE channel_id = ?",
-        (channel_id,),
-    )
+    cursor = conn.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
     conn.commit()
     removed = cursor.rowcount > 0
     conn.close()
@@ -229,10 +240,7 @@ def remove_channel(channel_id: str) -> bool:
 
 def update_channel_title(channel_id: str, title: str):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "UPDATE channels SET channel_title = ? WHERE channel_id = ?",
-        (title, channel_id),
-    )
+    conn.execute("UPDATE channels SET channel_title = ? WHERE channel_id = ?", (title, channel_id))
     conn.commit()
     conn.close()
 
@@ -261,6 +269,7 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
     conn = sqlite3.connect(DB_PATH)
     query_clean = query.strip().lower().replace(" ", "")
 
+    # 1) Exact match (newest first)
     cursor = conn.execute(
         "SELECT app_name, full_text, link, message_id FROM channel_posts "
         "WHERE LOWER(REPLACE(app_name, ' ', '')) = ? "
@@ -272,13 +281,16 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
         for r in cursor.fetchall()
     ]
 
-    if not results:
+    # 2) Partial match (newest first) — but only if query is long enough
+    # Don't do broad LIKE search for very short queries (< 4 chars)
+    # because it returns too many false matches
+    if not results and len(query.strip()) >= 4:
         like_query = f"%{query.strip().lower()}%"
         cursor = conn.execute(
             "SELECT app_name, full_text, link, message_id FROM channel_posts "
-            "WHERE LOWER(app_name) LIKE ? OR LOWER(full_text) LIKE ? "
+            "WHERE LOWER(app_name) LIKE ? "
             "ORDER BY created_at DESC",
-            (like_query, like_query),
+            (like_query,),
         )
         results = [
             {"app_name": r[0], "text": r[1], "link": r[2], "message_id": r[3]}
@@ -320,14 +332,12 @@ def get_post_count() -> int:
 
 
 def build_message_link(chat_id: int, message_id: int) -> str:
-    # Check if any public channel username is configured
     channels = get_channels()
     for ch in channels:
         ch_id = ch["id"]
-        if not ch_id.startswith("-"):  # Public channel (username)
+        if not ch_id.startswith("-"):
             return f"https://t.me/{ch_id}/{message_id}"
 
-    # Private channel link format
     if chat_id < 0:
         positive_id = str(chat_id).replace("-100", "", 1)
         return f"https://t.me/c/{positive_id}/{message_id}"
@@ -381,7 +391,7 @@ def init_gemini():
                             test_response = test_model.generate_content("Respond with OK")
                             if test_response and test_response.text:
                                 selected_model = m.name
-                                logger.info("✅ Gemini AI initialized with model: %s (from list)", selected_model)
+                                logger.info("✅ Gemini AI: %s (from list)", selected_model)
                                 break
                         except Exception:
                             continue
@@ -399,8 +409,10 @@ def init_gemini():
                 "Given a message from a Telegram group user, extract the app name "
                 "they are looking for. "
                 "Respond with ONLY the app name, nothing else. "
-                "If the message is not about an app, respond with 'NONE'. "
+                "If the message is not about searching for an app, respond with 'NONE'. "
                 "Handle spelling mistakes, Hinglish, and messy sentences. "
+                "IMPORTANT: Normal conversation like 'hello', 'thanks', 'ok', "
+                "'ab nhi ho payega', 'me hi hu', 'kaise ho' should return NONE. "
                 "Examples:\n"
                 "Input: 'bhai remini ka apk update krdo pls' → Output: Remini\n"
                 "Input: 'I stream flare apk chahiye' → Output: I Stream Flare\n"
@@ -410,6 +422,10 @@ def init_gemini():
                 "Input: 'cupcut' → Output: CapCut\n"
                 "Input: 'tirculler' → Output: Truecaller\n"
                 "Input: '#QuickTv' → Output: QuickTv\n"
+                "Input: 'ab nhi ho payega' → Output: NONE\n"
+                "Input: 'me hi hu' → Output: NONE\n"
+                "Input: 'are grok dedo bahut phle dia tha' → Output: NONE\n"
+                "Input: 'ok bhai thanks' → Output: NONE\n"
             ),
         )
 
@@ -423,7 +439,16 @@ def init_gemini():
 
 
 async def gemini_extract_app_name(message_text: str) -> str:
+    """
+    Use Gemini AI to extract app name from user message.
+    Returns the app name, or empty string if not an app request.
+
+    IMPORTANT: If Gemini says NONE, we return empty string and
+    do NOT fall back to heuristic — Gemini's judgment is final.
+    Heuristic is only used when Gemini is not available at all.
+    """
     if not _gemini_model:
+        # Gemini not available — use heuristic
         return extract_app_name_from_sentence(message_text)
 
     try:
@@ -437,7 +462,8 @@ async def gemini_extract_app_name(message_text: str) -> str:
         result = result.strip().strip('"').strip("'").strip()
 
         if result.upper() == "NONE" or not result or len(result) < 2:
-            return ""
+            logger.info("Gemini said NONE for: '%s'", message_text)
+            return ""  # Do NOT fall back to heuristic
 
         logger.info("Gemini extracted: '%s' from '%s'", result, message_text)
         return result
@@ -481,7 +507,7 @@ async def gemini_fuzzy_search(app_name: str, db_results: list) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Text extraction (fallback)
+# Text extraction (fallback — only when Gemini is not available)
 # ---------------------------------------------------------------------------
 def extract_hashtags(text: str) -> list:
     matches = HASHTAG_PATTERN.findall(text)
@@ -503,46 +529,71 @@ def extract_app_name_from_sentence(text: str) -> str:
         return hashtags[0]
     cleaned = re.sub(r"[^\w\s]", " ", text)
     words = cleaned.split()
-    app_words = [w for w in words if w.lower() not in NOISE_WORDS and len(w) >= 2]
+    app_words = [w for w in words if w.lower() not in NOISE_WORDS and len(w) >= 3]
     return " ".join(app_words) if app_words else ""
 
 
 def is_search_request(text: str) -> bool:
+    """
+    Heuristic: decide if a group message looks like an app search request.
+
+    STRICT rules to avoid false positives:
+    - #hashtag → always yes
+    - Contains app-related keywords (apk, mod, etc.) → yes
+    - Single word that's ≥3 chars and not a noise word → yes
+    - Multi-word messages with app keywords → yes
+    - Everything else → NO (don't respond to normal chat)
+    """
     text = text.strip()
     if not text or len(text) < 2:
         return False
+
+    # #hashtag → definitely a search
     if HASHTAG_PATTERN.search(text):
         return True
+
     text_lower = text.lower()
+
+    # Contains app-related keywords
     app_keywords = {"apk", "app", "mod", "update", "link", "download",
                     "latest", "version", "chahiye", "chahiya", "dila",
-                    "dilado", "bhejo", "dena", "dedo", "krdo", "karo"}
+                    "dilado", "bhejo", "dena", "dedo", "krdo", "karo",
+                    "dedo", "mangta", "manga", "mango"}
     words = set(re.sub(r"[^\w\s]", " ", text_lower).split())
     if app_keywords & words:
         return True
+
+    # Single word (no spaces) → likely an app name search
+    # Must be ≥3 chars and not a noise word
     word_count = len(text.split())
-    if word_count <= 4:
+    if word_count == 1:
+        word = text.strip().lower().strip(".,!?;:'\"")
+        if len(word) >= 3 and word not in NOISE_WORDS:
+            return True
+        return False
+
+    # 2 words — must have at least one non-noise word ≥3 chars
+    if word_count == 2:
         non_noise = [
             w for w in text.split()
             if w.lower().strip(".,!?;:'\"") not in NOISE_WORDS
-            and len(w.strip(".,!?;:'\"")) >= 2
+            and len(w.strip(".,!?;:'\"")) >= 3
         ]
         if non_noise:
             return True
+        return False
+
+    # 3+ words — only respond if contains app keywords (already checked above)
+    # Otherwise don't respond (avoid false positives on normal chat)
     return False
 
 
 # ---------------------------------------------------------------------------
-# Auto-import channel history (Telethon) — imports ALL configured channels
+# Auto-import
 # ---------------------------------------------------------------------------
 async def import_channel_history(channel_target):
-    """Import history from a single channel."""
-    if not SESSION_STRING:
-        logger.warning("SESSION_STRING not set — cannot import.")
-        return 0, 0
-
-    if not API_ID or not API_HASH:
-        logger.warning("API_ID/API_HASH not set — cannot import.")
+    if not SESSION_STRING or not API_ID or not API_HASH:
+        logger.warning("Session/API not configured — cannot import.")
         return 0, 0
 
     try:
@@ -555,7 +606,6 @@ async def import_channel_history(channel_target):
     imported = 0
     skipped = 0
 
-    # Resolve target to int if numeric
     try:
         target_resolved = int(channel_target)
     except ValueError:
@@ -612,7 +662,6 @@ async def import_channel_history(channel_target):
 
 
 async def auto_import_all_channels():
-    """Import history from ALL configured channels."""
     channels = get_channels()
     if not channels:
         logger.info("No channels configured — skipping import.")
@@ -631,9 +680,8 @@ async def auto_import_all_channels():
 # Handlers
 # ---------------------------------------------------------------------------
 def is_owner(update: Update) -> bool:
-    """Check if the user is the bot owner."""
     if not OWNER_ID:
-        return True  # If OWNER_ID not set, allow everyone (for testing)
+        return True
     return update.effective_user.id == OWNER_ID
 
 
@@ -647,7 +695,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "📋 *How to use:*\n"
         "• Type an app name and I'll find it in the channel\n"
         "• You can use `#AppName` or just type the name\n"
-        "• Type a full sentence: `bhai remini ka apk update krdo pls`\n"
         "• Spelling mistakes are OK — AI will understand!\n\n"
         "✨ *Examples:*\n"
         "• `#QuickTv`\n"
@@ -679,7 +726,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def addchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add a channel to monitor. Usage: /addchannel -1001234567890"""
     if not is_owner(update):
         await update.message.reply_text("❌ Only the bot owner can add channels.")
         return
@@ -698,7 +744,6 @@ async def addchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     channel_id = context.args[0].strip()
 
-    # Check if already exists
     channels = get_channels()
     if any(ch["id"] == channel_id for ch in channels):
         await update.message.reply_text(
@@ -707,30 +752,23 @@ async def addchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    # Add to database
     if add_channel(channel_id):
         await update.message.reply_text(
             f"✅ Channel `{channel_id}` added!\n"
-            f"⏳ Importing channel history... This may take a few minutes.\n"
-            f"Run /stats to check progress.",
+            f"⏳ Importing channel history...",
             parse_mode="Markdown",
         )
 
-        # Auto-import this channel's history in background
         def run_import():
             asyncio.run(import_channel_history(channel_id))
 
         thread = threading.Thread(target=run_import, daemon=True)
         thread.start()
     else:
-        await update.message.reply_text(
-            f"❌ Failed to add channel `{channel_id}`.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(f"❌ Failed to add channel `{channel_id}`.")
 
 
 async def listchannels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all configured channels."""
     channels = get_channels()
     if not channels:
         await update.message.reply_text(
@@ -745,22 +783,17 @@ async def listchannels_command(update: Update, context: ContextTypes.DEFAULT_TYP
         title = ch["title"] or "Unknown"
         lines.append(f"{i}. *{title}*\n   ID: `{ch['id']}`")
 
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode="Markdown",
-    )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def removechannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove a channel. Usage: /removechannel -1001234567890"""
     if not is_owner(update):
         await update.message.reply_text("❌ Only the bot owner can remove channels.")
         return
 
     if not context.args:
         await update.message.reply_text(
-            "📋 *Remove Channel*\n\n"
-            "Usage: `/removechannel <channel_id>`\n\n"
-            "Use `/listchannels` to see configured channels.",
+            "📋 *Remove Channel*\n\nUsage: `/removechannel <channel_id>`",
             parse_mode="Markdown",
         )
         return
@@ -768,32 +801,17 @@ async def removechannel_command(update: Update, context: ContextTypes.DEFAULT_TY
     channel_id = context.args[0].strip()
 
     if remove_channel(channel_id):
-        await update.message.reply_text(
-            f"✅ Channel `{channel_id}` removed.\n"
-            f"Note: Previously imported posts are still in the database.\n"
-            f"They will be removed on next full re-import.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(f"✅ Channel `{channel_id}` removed.")
     else:
-        await update.message.reply_text(
-            f"❌ Channel `{channel_id}` not found.\n"
-            f"Use `/listchannels` to see configured channels.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(f"❌ Channel `{channel_id}` not found.")
 
 
 async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manually trigger import for all channels."""
     if not SESSION_STRING:
-        await update.message.reply_text(
-            "❌ Import not available.\n"
-            "Session string not configured."
-        )
+        await update.message.reply_text("❌ Import not available. Session string not configured.")
         return
 
-    await update.message.reply_text(
-        "⏳ Importing all channel history... This may take a few minutes."
-    )
+    await update.message.reply_text("⏳ Importing all channel history...")
 
     def run_import():
         asyncio.run(auto_import_all_channels())
@@ -803,8 +821,7 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     count = get_post_count()
     await update.message.reply_text(
-        f"✅ Import started! Current database has *{count}* posts.\n"
-        f"Run /stats after a minute to check.",
+        f"✅ Import started! Current database has *{count}* posts.",
         parse_mode="Markdown",
     )
 
@@ -830,17 +847,26 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     message_text = update.message.text
+
+    # Step 1: Heuristic check — is this even a search request?
+    # If not, skip entirely (saves Gemini API calls too)
     if not is_search_request(message_text):
         return
 
+    # Step 2: Use Gemini AI to extract app name
+    # If Gemini says NONE, we STOP — do not fall back to heuristic
     app_query = await gemini_extract_app_name(message_text)
+
     if not app_query or len(app_query) < 2:
+        # Gemini said NONE or empty — this is NOT an app search
         return
 
     logger.info("Searching: '%s' (from: '%s')", app_query, message_text)
 
+    # Step 3: Search database
     results = search_by_app_name(app_query, limit=5)
 
+    # Step 4: If no exact match, try Gemini fuzzy search
     if not results and _gemini_model:
         logger.info("No exact match — Gemini fuzzy search...")
         all_names = get_all_app_names()
@@ -909,7 +935,7 @@ async def post_init(application: Application) -> None:
     init_gemini()
     count = get_post_count()
     if count == 0:
-        logger.info("Database is empty — running auto-import for all channels...")
+        logger.info("Database is empty — running auto-import...")
         await auto_import_all_channels()
     else:
         logger.info("Database has %d posts — skipping auto-import.", count)
@@ -929,7 +955,6 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("stats", stats_command))
@@ -938,10 +963,8 @@ def main() -> None:
     app.add_handler(CommandHandler("listchannels", listchannels_command))
     app.add_handler(CommandHandler("removechannel", removechannel_command))
 
-    # Channel post handler
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, channel_post_handler))
 
-    # Group message handler
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
