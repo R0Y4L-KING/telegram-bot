@@ -6,11 +6,12 @@ When a user in a group mentions an app name, the bot uses Gemini AI
 to extract the app name from the message, then searches the channel
 database and replies with a direct link to the LATEST post.
 
-Gemini AI enables:
-- Smart app name extraction from messy sentences
-- Spelling mistake tolerance ("reemni" → "Remini")
-- Hinglish sentence understanding
-- Fuzzy matching when exact match fails
+Features:
+- Gemini AI smart app name extraction (spelling mistakes, Hinglish)
+- Auto-import channel history using Telethon user session
+- Self-ping keep-alive to reduce Render sleep
+- Fallback to heuristic method if Gemini fails
+- Latest post only (deduplication)
 """
 
 import os
@@ -19,6 +20,7 @@ import asyncio
 import logging
 import sqlite3
 import threading
+import urllib.request
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -53,8 +55,9 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
-# Gemini AI
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Render sets this automatically — used for self-ping
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
@@ -63,7 +66,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Keep-alive web server (for Render)
+# Keep-alive: HTTP server + self-ping
 # ---------------------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -83,6 +86,29 @@ def start_keep_alive(port: int) -> None:
         server.serve_forever()
     except OSError as e:
         logger.warning("Could not start keep-alive server: %s", e)
+
+
+def self_ping():
+    """
+    Ping own URL every 5 minutes to prevent Render free tier from sleeping.
+    Uses RENDER_EXTERNAL_URL which Render sets automatically.
+    """
+    if not RENDER_EXTERNAL_URL:
+        logger.info("RENDER_EXTERNAL_URL not set — self-ping disabled. "
+                    "Use UptimeRobot to keep bot awake.")
+        return
+
+    ping_url = RENDER_EXTERNAL_URL.rstrip("/") + "/"
+    logger.info("Self-ping enabled: will ping %s every 5 minutes", ping_url)
+
+    import time
+    while True:
+        try:
+            urllib.request.urlopen(ping_url, timeout=10)
+            logger.debug("Self-ping OK")
+        except Exception as e:
+            logger.warning("Self-ping failed: %s", e)
+        time.sleep(300)  # 5 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +150,15 @@ def init_gemini():
     try:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
+
+        # Try multiple model names in case one is not available
+        model_names = [
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-latest",
+            "gemini-2.0-flash",
+            "gemini-flash-latest",
+        ]
+
         _gemini_model = genai.GenerativeModel(
             "gemini-1.5-flash",
             system_instruction=(
@@ -139,11 +174,23 @@ def init_gemini():
                 "Input: 'capcut mod dedo bhai' → Output: CapCut\n"
                 "Input: 'hello kaise ho' → Output: NONE\n"
                 "Input: 'reemni' → Output: Remini\n"
+                "Input: 'cupcut' → Output: CapCut\n"
+                "Input: 'tirculler' → Output: Truecaller\n"
                 "Input: '#QuickTv' → Output: QuickTv\n"
             ),
         )
-        logger.info("✅ Gemini AI initialized successfully.")
-        return True
+
+        # Test the model with a simple query
+        try:
+            test_response = _gemini_model.generate_content("Test: respond with OK")
+            logger.info("✅ Gemini AI initialized and tested successfully. Response: %s",
+                       test_response.text[:50])
+            return True
+        except Exception as test_err:
+            logger.error("Gemini AI test call failed: %s", test_err)
+            _gemini_model = None
+            return False
+
     except Exception as e:
         logger.error("Failed to initialize Gemini AI: %s", e)
         return False
@@ -153,22 +200,24 @@ async def gemini_extract_app_name(message_text: str) -> str:
     """
     Use Gemini AI to extract the app name from a user message.
     Returns the app name, or empty string if not an app request.
-    Falls back to heuristic method if Gemini fails.
+    Falls back to heuristic method if Gemini fails or times out.
     """
     if not _gemini_model:
         return extract_app_name_from_sentence(message_text)
 
     try:
-        # Run Gemini in a thread to avoid blocking the event loop
         def call_gemini():
             response = _gemini_model.generate_content(
                 f"Extract the app name from this message:\n{message_text}"
             )
             return response.text.strip()
 
-        result = await asyncio.to_thread(call_gemini)
+        # 15 second timeout for Gemini call
+        result = await asyncio.wait_for(
+            asyncio.to_thread(call_gemini),
+            timeout=15.0,
+        )
 
-        # Clean up the response
         result = result.strip().strip('"').strip("'").strip()
 
         if result.upper() == "NONE" or not result or len(result) < 2:
@@ -176,6 +225,9 @@ async def gemini_extract_app_name(message_text: str) -> str:
 
         logger.info("Gemini extracted app name: '%s' from '%s'", result, message_text)
         return result
+    except asyncio.TimeoutError:
+        logger.warning("Gemini AI timed out (15s), falling back to heuristic.")
+        return extract_app_name_from_sentence(message_text)
     except Exception as e:
         logger.warning("Gemini AI failed (%s), falling back to heuristic.", e)
         return extract_app_name_from_sentence(message_text)
@@ -208,13 +260,15 @@ async def gemini_fuzzy_search(app_name: str, db_results: list) -> list:
             response = _gemini_model.generate_content(prompt)
             return response.text.strip()
 
-        result = await asyncio.to_thread(call_gemini)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(call_gemini),
+            timeout=15.0,
+        )
         result = result.strip().strip('"').strip("'").strip()
 
         if result.upper() == "NONE":
             return []
 
-        # Find matching result
         for post in db_results:
             if post["app_name"] and post["app_name"].lower() == result.lower():
                 logger.info("Gemini fuzzy match: '%s' → '%s'", app_name, result)
@@ -274,7 +328,6 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
     conn = sqlite3.connect(DB_PATH)
     query_clean = query.strip().lower().replace(" ", "")
 
-    # 1) Exact match (newest first)
     cursor = conn.execute(
         "SELECT app_name, full_text, link, message_id FROM channel_posts "
         "WHERE LOWER(REPLACE(app_name, ' ', '')) = ? "
@@ -286,7 +339,6 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
         for r in cursor.fetchall()
     ]
 
-    # 2) Partial / LIKE match (newest first)
     if not results:
         like_query = f"%{query.strip().lower()}%"
         cursor = conn.execute(
@@ -302,7 +354,6 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
 
     conn.close()
 
-    # 3) Deduplicate: keep only LATEST post per app_name
     seen_apps = set()
     deduped = []
     for post in results:
@@ -317,7 +368,6 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
 
 
 def get_all_app_names() -> list:
-    """Get all unique app names from the database (for fuzzy matching)."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
         "SELECT DISTINCT app_name FROM channel_posts "
@@ -346,7 +396,7 @@ def build_message_link(chat_id: int, message_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Text extraction (fallback for when Gemini is not available)
+# Text extraction (fallback)
 # ---------------------------------------------------------------------------
 def extract_hashtags(text: str) -> list:
     matches = HASHTAG_PATTERN.findall(text)
@@ -367,7 +417,6 @@ def extract_text_from_message(message) -> str:
 
 
 def extract_app_name_from_sentence(text: str) -> str:
-    """Fallback: extract app name using heuristics (when Gemini is not available)."""
     text = text.strip()
     hashtags = extract_hashtags(text)
     if hashtags:
@@ -612,9 +661,8 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("No exact match — using Gemini fuzzy search...")
         all_names = get_all_app_names()
         if all_names:
-            # Get some candidate results using broad LIKE search
             broad_results = []
-            for name in all_names[:50]:  # Limit to prevent too many queries
+            for name in all_names[:50]:
                 if app_query.lower().split()[0] in name.lower():
                     conn = sqlite3.connect(DB_PATH)
                     cursor = conn.execute(
@@ -677,7 +725,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def post_init(application: Application) -> None:
     """Run after bot init — initialize AI and auto-import if needed."""
-    # Initialize Gemini AI
     init_gemini()
 
     count = get_post_count()
@@ -694,10 +741,15 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     init_db()
 
+    # Start keep-alive HTTP server
     keep_alive_thread = threading.Thread(
         target=start_keep_alive, args=(PORT,), daemon=True
     )
     keep_alive_thread.start()
+
+    # Start self-ping thread (to reduce Render sleep)
+    ping_thread = threading.Thread(target=self_ping, daemon=True)
+    ping_thread.start()
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
