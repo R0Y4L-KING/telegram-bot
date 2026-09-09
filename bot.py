@@ -1,12 +1,16 @@
 """
-Telegram Group Helper Bot — Channel APK Search
-=============================================
+Telegram Group Helper Bot — Channel APK Search with Gemini AI
+=============================================================
 Monitors a Telegram channel for posts containing #AppName tags.
-When a user in a group mentions an app name, the bot searches the
-channel database and replies with a direct link to the LATEST post.
+When a user in a group mentions an app name, the bot uses Gemini AI
+to extract the app name from the message, then searches the channel
+database and replies with a direct link to the LATEST post.
 
-Auto-import: On first startup, the bot imports existing channel history
-using a user session string (Telethon), because bots cannot read history.
+Gemini AI enables:
+- Smart app name extraction from messy sentences
+- Spelling mistake tolerance ("reemni" → "Remini")
+- Hinglish sentence understanding
+- Fuzzy matching when exact match fails
 """
 
 import os
@@ -47,8 +51,10 @@ PORT = int(os.getenv("PORT", "10000"))
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-# Strip whitespace/newlines that might get added during copy-paste
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+
+# Gemini AI
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
@@ -104,6 +110,123 @@ NOISE_WORDS = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Gemini AI — Smart app name extraction
+# ---------------------------------------------------------------------------
+_gemini_model = None
+
+
+def init_gemini():
+    """Initialize Gemini AI model. Call once at startup."""
+    global _gemini_model
+    if not GEMINI_API_KEY:
+        logger.info("GEMINI_API_KEY not set — AI features disabled, using fallback.")
+        return False
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        _gemini_model = genai.GenerativeModel(
+            "gemini-1.5-flash",
+            system_instruction=(
+                "You are an app name extractor bot. "
+                "Given a message from a Telegram group user, extract the app name "
+                "they are looking for. "
+                "Respond with ONLY the app name, nothing else. "
+                "If the message is not about an app, respond with 'NONE'. "
+                "Handle spelling mistakes, Hinglish, and messy sentences. "
+                "Examples:\n"
+                "Input: 'bhai remini ka apk update krdo pls' → Output: Remini\n"
+                "Input: 'I stream flare apk chahiye' → Output: I Stream Flare\n"
+                "Input: 'capcut mod dedo bhai' → Output: CapCut\n"
+                "Input: 'hello kaise ho' → Output: NONE\n"
+                "Input: 'reemni' → Output: Remini\n"
+                "Input: '#QuickTv' → Output: QuickTv\n"
+            ),
+        )
+        logger.info("✅ Gemini AI initialized successfully.")
+        return True
+    except Exception as e:
+        logger.error("Failed to initialize Gemini AI: %s", e)
+        return False
+
+
+async def gemini_extract_app_name(message_text: str) -> str:
+    """
+    Use Gemini AI to extract the app name from a user message.
+    Returns the app name, or empty string if not an app request.
+    Falls back to heuristic method if Gemini fails.
+    """
+    if not _gemini_model:
+        return extract_app_name_from_sentence(message_text)
+
+    try:
+        # Run Gemini in a thread to avoid blocking the event loop
+        def call_gemini():
+            response = _gemini_model.generate_content(
+                f"Extract the app name from this message:\n{message_text}"
+            )
+            return response.text.strip()
+
+        result = await asyncio.to_thread(call_gemini)
+
+        # Clean up the response
+        result = result.strip().strip('"').strip("'").strip()
+
+        if result.upper() == "NONE" or not result or len(result) < 2:
+            return ""
+
+        logger.info("Gemini extracted app name: '%s' from '%s'", result, message_text)
+        return result
+    except Exception as e:
+        logger.warning("Gemini AI failed (%s), falling back to heuristic.", e)
+        return extract_app_name_from_sentence(message_text)
+
+
+async def gemini_fuzzy_search(app_name: str, db_results: list) -> list:
+    """
+    Use Gemini AI to pick the best match from database results
+    when exact match is not found.
+    """
+    if not _gemini_model or not db_results:
+        return db_results
+
+    try:
+        app_names_in_db = [r["app_name"] for r in db_results if r["app_name"]]
+        if not app_names_in_db:
+            return db_results
+
+        def call_gemini():
+            prompt = (
+                f"The user searched for: '{app_name}'\n"
+                f"Available apps in database:\n"
+            )
+            for i, name in enumerate(app_names_in_db, 1):
+                prompt += f"{i}. {name}\n"
+            prompt += (
+                f"\nWhich of these apps is the user most likely looking for? "
+                f"Respond with ONLY the app name, or 'NONE' if no good match."
+            )
+            response = _gemini_model.generate_content(prompt)
+            return response.text.strip()
+
+        result = await asyncio.to_thread(call_gemini)
+        result = result.strip().strip('"').strip("'").strip()
+
+        if result.upper() == "NONE":
+            return []
+
+        # Find matching result
+        for post in db_results:
+            if post["app_name"] and post["app_name"].lower() == result.lower():
+                logger.info("Gemini fuzzy match: '%s' → '%s'", app_name, result)
+                return [post]
+
+        return db_results
+    except Exception as e:
+        logger.warning("Gemini fuzzy search failed (%s), returning raw results.", e)
+        return db_results
+
+
+# ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 def init_db() -> None:
@@ -151,6 +274,7 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
     conn = sqlite3.connect(DB_PATH)
     query_clean = query.strip().lower().replace(" ", "")
 
+    # 1) Exact match (newest first)
     cursor = conn.execute(
         "SELECT app_name, full_text, link, message_id FROM channel_posts "
         "WHERE LOWER(REPLACE(app_name, ' ', '')) = ? "
@@ -162,6 +286,7 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
         for r in cursor.fetchall()
     ]
 
+    # 2) Partial / LIKE match (newest first)
     if not results:
         like_query = f"%{query.strip().lower()}%"
         cursor = conn.execute(
@@ -177,6 +302,7 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
 
     conn.close()
 
+    # 3) Deduplicate: keep only LATEST post per app_name
     seen_apps = set()
     deduped = []
     for post in results:
@@ -188,6 +314,18 @@ def search_by_app_name(query: str, limit: int = 5) -> list:
             break
 
     return deduped
+
+
+def get_all_app_names() -> list:
+    """Get all unique app names from the database (for fuzzy matching)."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        "SELECT DISTINCT app_name FROM channel_posts "
+        "WHERE app_name IS NOT NULL ORDER BY app_name"
+    )
+    names = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    return names
 
 
 def get_post_count() -> int:
@@ -208,7 +346,7 @@ def build_message_link(chat_id: int, message_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Text extraction
+# Text extraction (fallback for when Gemini is not available)
 # ---------------------------------------------------------------------------
 def extract_hashtags(text: str) -> list:
     matches = HASHTAG_PATTERN.findall(text)
@@ -229,6 +367,7 @@ def extract_text_from_message(message) -> str:
 
 
 def extract_app_name_from_sentence(text: str) -> str:
+    """Fallback: extract app name using heuristics (when Gemini is not available)."""
     text = text.strip()
     hashtags = extract_hashtags(text)
     if hashtags:
@@ -267,7 +406,7 @@ def is_search_request(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Auto-import channel history (using Telethon + user session string)
+# Auto-import channel history (Telethon)
 # ---------------------------------------------------------------------------
 def get_channel_target():
     if CHANNEL_USERNAME:
@@ -278,15 +417,10 @@ def get_channel_target():
 
 
 async def auto_import_history_async():
-    """
-    Import all existing channel posts using a Telethon user session string.
-    Telegram bots cannot read channel history, so we use a user session.
-    """
     if not SESSION_STRING:
         logger.warning(
             "SESSION_STRING not set — skipping auto-import. "
-            "Run generate_session.py locally to get a session string, "
-            "then add it to your environment variables."
+            "Run generate_session.py locally to get a session string."
         )
         return 0
 
@@ -296,15 +430,12 @@ async def auto_import_history_async():
 
     channel_target = get_channel_target()
     if not channel_target:
-        logger.warning(
-            "CHANNEL_USERNAME or CHANNEL_ID not set — skipping auto-import."
-        )
+        logger.warning("CHANNEL_USERNAME or CHANNEL_ID not set — skipping.")
         return 0
 
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
-        from telethon.tl.types import Channel
     except ImportError:
         logger.error("Telethon not installed! Run: pip install telethon")
         return 0
@@ -315,20 +446,13 @@ async def auto_import_history_async():
 
     client = None
     try:
-        client = TelegramClient(
-            StringSession(SESSION_STRING),
-            API_ID,
-            API_HASH,
-        )
-
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
         await client.start()
         logger.info("Telethon user session started, reading channel history...")
 
-        # Resolve the channel entity
         entity = await client.get_entity(channel_target)
         logger.info("Resolved channel entity: %s", getattr(entity, 'title', str(channel_target)))
 
-        # Iterate through all messages (newest first)
         async for message in client.iter_messages(entity):
             text = message.text or message.message or ""
             if not text:
@@ -337,7 +461,6 @@ async def auto_import_history_async():
 
             chat_id = message.chat_id or message.peer_id.channel_id
             if hasattr(message.peer_id, 'channel_id'):
-                # Convert to Telegram's internal format for link building
                 chat_id = -1000000000000 - message.peer_id.channel_id
             message_id = message.id
             link = build_message_link(chat_id, message_id)
@@ -377,20 +500,22 @@ async def auto_import_history_async():
 # ---------------------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     count = get_post_count()
+    ai_status = "✅ Enabled" if _gemini_model else "❌ Disabled"
     text = (
         "👋 *Hello!*\n\n"
-        "I'm a *Channel APK Search Bot*.\n\n"
+        "I'm a *Channel APK Search Bot* with AI.\n\n"
         "📋 *How to use:*\n"
         "• Type an app name and I'll find it in the channel\n"
         "• You can use `#AppName` or just type the name\n"
-        "• You can also type a full sentence like: "
-        "`bhai remini ka apk update krdo pls`\n\n"
+        "• Type a full sentence: `bhai remini ka apk update krdo pls`\n"
+        "• Spelling mistakes are OK — AI will understand!\n\n"
         "✨ *Examples:*\n"
         "• `#QuickTv`\n"
         "• `remini`\n"
         "• `bhai capcut ka mod dila do`\n"
-        "• `I stream flare apk update`\n\n"
-        "📌 I always give the *latest* link for each app.\n\n"
+        "• `reemni` (spelling mistake — AI will fix!)\n\n"
+        "📌 I always give the *latest* link for each app.\n"
+        f"🤖 AI: {ai_status}\n\n"
         f"📚 Currently tracking *{count}* channel posts."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -398,14 +523,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     count = get_post_count()
+    ai_status = "✅ Enabled" if _gemini_model else "❌ Disabled"
     await update.message.reply_text(
-        f"📊 *Bot Statistics*\n\n📚 Total channel posts: *{count}*",
+        f"📊 *Bot Statistics*\n\n"
+        f"📚 Total channel posts: *{count}*\n"
+        f"🤖 AI: {ai_status}",
         parse_mode="Markdown",
     )
 
 
 async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manually trigger channel history import."""
     if not SESSION_STRING:
         await update.message.reply_text(
             "❌ Import not available.\n"
@@ -457,7 +584,6 @@ async def channel_post_handler(
 
 
 async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Safety check: make sure message and text exist
     if not update.message or not update.message.text:
         return
 
@@ -465,16 +591,47 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not is_search_request(message_text):
         return
-    app_query = extract_app_name_from_sentence(message_text)
+
+    # Use Gemini AI to extract app name (falls back to heuristic if no AI)
+    app_query = await gemini_extract_app_name(message_text)
+
     if not app_query or len(app_query) < 2:
         return
+
     logger.info(
         "Searching for: '%s' (extracted from: '%s') — user: %s, chat: %s",
         app_query, message_text,
         update.effective_user.username or update.effective_user.id,
         update.effective_chat.id,
     )
+
     results = search_by_app_name(app_query, limit=5)
+
+    # If no exact match, use Gemini for fuzzy matching
+    if not results and _gemini_model:
+        logger.info("No exact match — using Gemini fuzzy search...")
+        all_names = get_all_app_names()
+        if all_names:
+            # Get some candidate results using broad LIKE search
+            broad_results = []
+            for name in all_names[:50]:  # Limit to prevent too many queries
+                if app_query.lower().split()[0] in name.lower():
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.execute(
+                        "SELECT app_name, full_text, link, message_id "
+                        "FROM channel_posts WHERE LOWER(app_name) = ? "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (name.lower(),),
+                    )
+                    for r in cursor.fetchall():
+                        broad_results.append(
+                            {"app_name": r[0], "text": r[1], "link": r[2], "message_id": r[3]}
+                        )
+                    conn.close()
+
+            if broad_results:
+                results = await gemini_fuzzy_search(app_query, broad_results)
+
     if not results:
         if HASHTAG_PATTERN.search(message_text):
             await update.message.reply_text(
@@ -483,6 +640,7 @@ async def find_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="Markdown",
             )
         return
+
     if len(results) == 1:
         post = results[0]
         preview = (post["text"] or "")[:120]
@@ -518,7 +676,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_init(application: Application) -> None:
-    """Run after bot init but before polling — auto-import if DB is empty."""
+    """Run after bot init — initialize AI and auto-import if needed."""
+    # Initialize Gemini AI
+    init_gemini()
+
     count = get_post_count()
     if count == 0:
         logger.info("Database is empty — running auto-import...")
